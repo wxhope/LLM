@@ -1,0 +1,160 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>AnythingLLM 文档上传</title>
+<style>
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; padding: 32px 20px;
+    font: 14px/1.6 -apple-system, "Segoe UI", "Microsoft YaHei", sans-serif;
+    background: #f6f7f9; color: #1f2328;
+  }
+  .wrap { max-width: 720px; margin: 0 auto; }
+  h1 { font-size: 20px; margin: 0 0 4px; }
+  .hint { color: #656d76; margin: 0 0 24px; }
+  .card { background: #fff; border: 1px solid #d8dee4; border-radius: 8px; padding: 20px; }
+  label { display: block; font-weight: 600; margin-bottom: 6px; font-size: 13px; }
+  input[type=text], input[type=password] {
+    width: 100%; padding: 8px 10px; border: 1px solid #d8dee4; border-radius: 6px;
+    font: inherit; margin-bottom: 16px; background: #fff;
+  }
+  input[type=file] { width: 100%; margin-bottom: 16px; font-size: 13px; }
+  button {
+    width: 100%; padding: 10px; border: 0; border-radius: 6px; cursor: pointer;
+    background: #1f6feb; color: #fff; font: 600 14px inherit;
+  }
+  button:disabled { background: #9db8dc; cursor: not-allowed; }
+  #log { margin-top: 20px; }
+  .line {
+    padding: 7px 10px; border-radius: 6px; margin-bottom: 6px;
+    background: #f6f8fa; border-left: 3px solid #d0d7de; word-break: break-all;
+    font-size: 13px;
+  }
+  .line.ok  { background: #eaf7ee; border-left-color: #1a7f37; }
+  .line.err { background: #fdeef0; border-left-color: #cf222e; color: #b0202b; }
+  .line.run { background: #eef4fd; border-left-color: #1f6feb; }
+  .note { margin-top: 20px; font-size: 12px; color: #656d76; }
+  code { background: #f0f2f5; padding: 1px 5px; border-radius: 4px; font-size: 12px; }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <h1>AnythingLLM 文档上传</h1>
+  <p class="hint">把文档上传到第一个工作区，并完成向量化嵌入。</p>
+
+  <div class="card">
+    <label for="base">API 地址</label>
+    <input id="base" type="text" value="http://127.0.0.1:3001">
+
+    <label for="key">API Key</label>
+    <input id="key" type="password" value="5P5F2PS-B2S44PV-HEW7AGR-7ZM6VJR">
+
+    <label for="files">选择文档（可多选）</label>
+    <input id="files" type="file" multiple>
+
+    <button id="go">上传并向量化</button>
+
+    <div id="log"></div>
+  </div>
+
+  <p class="note">
+    调用的接口：<code>POST /api/v1/document/upload</code> →
+    <code>POST /api/v1/workspace/{slug}/update-embeddings</code><br>
+    Key 会以明文保存在本页面里，仅供本机自用，不要把这个文件分享出去。
+  </p>
+</div>
+
+<script>
+const baseEl = document.getElementById('base');
+const keyEl = document.getElementById('key');
+const filesEl = document.getElementById('files');
+const goEl = document.getElementById('go');
+const logEl = document.getElementById('log');
+
+function log(msg, kind) {
+  const el = document.createElement('div');
+  el.className = 'line' + (kind ? ' ' + kind : '');
+  el.textContent = msg;
+  logEl.appendChild(el);
+  el.scrollIntoView({ block: 'nearest' });
+}
+
+async function api(path, options) {
+  const base = baseEl.value.trim().replace(/\/+$/, '');
+  const key = keyEl.value.trim();
+  const opts = options || {};
+  const res = await fetch(base + path, {
+    method: opts.method || 'GET',
+    headers: Object.assign(
+      { Authorization: 'Bearer ' + key, Accept: 'application/json' },
+      opts.headers || {}
+    ),
+    body: opts.body,
+  });
+  const text = await res.text();
+  let data;
+  try { data = JSON.parse(text); } catch (e) { data = { error: text.slice(0, 300) }; }
+  if (!res.ok) {
+    const detail = (data && data.error) ? data.error : ('HTTP ' + res.status);
+    if (res.status === 403) throw new Error('API Key 无效（403）');
+    throw new Error(detail);
+  }
+  if (data && data.error) throw new Error(data.error);
+  return data;
+}
+
+async function run() {
+  logEl.innerHTML = '';
+  goEl.disabled = true;
+  try {
+    if (!keyEl.value.trim()) throw new Error('请填写 API Key');
+
+    const files = Array.from(filesEl.files || []);
+    if (!files.length) throw new Error('请先选择要上传的文档');
+
+    log('步骤 1/3：读取工作区列表…', 'run');
+    const ws = await api('/api/v1/workspaces');
+    const list = ws.workspaces || [];
+    if (!list.length) throw new Error('AnythingLLM 里没有任何工作区');
+    const target = list[0];
+    log('目标工作区：' + target.name + '  (slug: ' + target.slug + ')', 'ok');
+
+    log('步骤 2/3：上传 ' + files.length + ' 个文档…', 'run');
+    const locations = [];
+    for (const file of files) {
+      const fd = new FormData();
+      fd.append('file', file);
+      const data = await api('/api/v1/document/upload', { method: 'POST', body: fd });
+      const doc = (data.documents || [])[0];
+      if (!doc || !doc.location) throw new Error('「' + file.name + '」上传后没有返回 location');
+      locations.push(doc.location);
+      log('  ✓ ' + file.name + ' → ' + doc.location, 'ok');
+    }
+
+    log('步骤 3/3：向量化嵌入到工作区…', 'run');
+    await api('/api/v1/workspace/' + target.slug + '/update-embeddings', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ adds: locations, deletes: [] }),
+    });
+    log('完成：' + locations.length + ' 个文档已加入「' + target.name + '」并完成向量化。', 'ok');
+    filesEl.value = '';
+  } catch (err) {
+    log('失败：' + (err && err.message ? err.message : String(err)), 'err');
+    if (err instanceof TypeError) {
+      log('请求被浏览器拦下了。可能原因：① AnythingLLM 没启动；'
+        + '② 页面在内置预览面板里打开时，其 CSP 只放行 127.0.0.1，'
+        + '所以 API 地址必须写 http://127.0.0.1:3001 而不是 http://localhost:3001；'
+        + '③ 直接双击 index.html（file://）也可能被拦，改用 serve.bat。', 'err');
+    }
+  } finally {
+    goEl.disabled = false;
+  }
+}
+
+goEl.addEventListener('click', run);
+</script>
+</body>
+</html>

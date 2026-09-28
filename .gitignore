@@ -1,0 +1,54 @@
+# ============================================================
+# E:\LLM 总仓库 —— 管理三个 MCP / 工具项目
+# 规则按「文件类型」全局匹配，因此对三个子目录同时生效
+# ============================================================
+
+# ---------- Python 虚拟环境（体积大，且可由 pip 重装）----------
+.venv/
+venv/
+env/
+ENV/
+
+# ---------- Python 缓存与构建产物 ----------
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+.eggs/
+build/
+dist/
+*.whl
+
+# ---------- 密钥与本地配置（最重要的防线）----------
+# 三个项目里的 .env 一律不进仓库。
+# AnythingLLMCP/.env 存有 AnythingLLM 的 Developer API Key。
+.env
+.env.*
+!.env.example
+*.env
+secrets.json
+credentials.json
+
+# ---------- 测试与覆盖率 ----------
+.pytest_cache/
+.coverage
+htmlcov/
+.tox/
+.mypy_cache/
+.ruff_cache/
+
+# ---------- 编辑器 ----------
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# ---------- 操作系统 ----------
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# ---------- 日志与临时文件 ----------
+*.log
+tmp/
+temp/
