@@ -29,6 +29,10 @@ dist/
 secrets.json
 credentials.json
 
+# Agent/Practice01/config.ini 存有 DeepSeek API Key，也绝不提交。
+# 这里的写法不带路径，因此任何子目录下的 config.ini 都会被忽略。
+config.ini
+
 # ---------- 测试与覆盖率 ----------
 .pytest_cache/
 .coverage
