@@ -1,0 +1,107 @@
+%% chat-stream-tool-fileOps.py 代码架构图
+%% 用法：把本文件全部内容粘贴到 https://mermaid.live/ 左侧代码框
+flowchart TB
+    subgraph UI["① 终端交互层 · main()"]
+        U1["input() 读取用户输入"]
+        U2["messages.append 追加 user 消息"]
+        U3{"输入是 exit / quit ?"}
+        U4(["程序退出"])
+    end
+
+    subgraph CORE["② 对话调度 · chat_with_tools()"]
+        C1["trim_history()<br/>超限历史按 user 边界整组丢弃"]
+        C2["stream_chat() 发一轮请求"]
+        C3{"reply 里有 tool_calls ?"}
+        C4["逐个执行工具<br/>结果以 role=tool 回填 messages"]
+        C5(["本轮回答结束"])
+    end
+
+    subgraph NET["③ 网络与流式解析 · stream_chat()"]
+        N1["拼 payload：model + messages<br/>+ tools + tool_choice=auto"]
+        N2["http.client 建 HTTPS 连接<br/>headers 带 Bearer api_key"]
+        N3["readline 逐行读 SSE 的 data: 分片"]
+        N4["delta.content 累积"]
+        N5["delta.tool_calls 按 index 拼槽位<br/>name 与 arguments 字符串累加"]
+        N6["返回 assistant 消息 dict<br/>content + tool_calls"]
+    end
+
+    subgraph DISPATCH["④ 工具分发 · run_tool()"]
+        D0["parse_args() 拆 JSON"]
+        D1{"工具名匹配"}
+        D2["getDate"]
+        D3["isLeapYear"]
+        D4["FILE_TOOLS 字典<br/>10 个文件工具"]
+        D5["未知工具 → 返回错误文本"]
+    end
+
+    subgraph TOOLS["⑤ 工具实现层"]
+        T1["run_date_command()<br/>调本机 date / Get-Date"]
+        T2["is_leap_year()<br/>纯 Python 闰年判定"]
+        T3["getCwd / listDir<br/>getFileType"]
+        T4["readFile / editFile<br/>纯文本读写"]
+        T5["createFile / createDir<br/>renamePath"]
+        T6["deleteDir / deleteFile<br/>破坏性操作"]
+    end
+
+    subgraph SAFE["⑥ 安全防线（横切）"]
+        S1["need_path()<br/>空 path 直接拒绝"]
+        S2["is_root_like() / is_protected()<br/>拦盘根与用户主目录"]
+        S3["confirm() 打印 y/N<br/>默认 No"]
+        S4["is_binary_file()<br/>前 8KB 含 NUL 即拒读"]
+        S5["renamePath 拒绝覆盖<br/>先 exists 再 rename"]
+    end
+
+    subgraph OUT["⑦ 输出层"]
+        O1["type_out()<br/>逐字打印 + flush"]
+    end
+
+    CFG[("config.ini<br/>api_key / base_url / model")]
+    TOOLSJSON[/"TOOLS 常量<br/>11 项 schema + SYSTEM_PROMPT"/]
+
+    U1 --> U3
+    U3 -- "是" --> U4
+    U3 -- "否" --> U2
+    U2 --> C1
+    C1 --> C2
+    C2 --> N1
+    CFG -.-> N1
+    TOOLSJSON -.-> N1
+    N1 --> N2
+    N2 --> N3
+    N3 --> N4
+    N3 --> N5
+    N4 --> O1
+    N4 --> N6
+    N5 --> N6
+    N6 --> C3
+    C3 -- "否" --> C5
+    C5 --> U1
+    C3 -- "是" --> C4
+    C4 -- "下一轮" --> C1
+    C4 --> D0
+    D0 --> D1
+    D1 -- "getDate" --> D2
+    D1 -- "isLeapYear" --> D3
+    D1 -- "命中 FILE_TOOLS" --> D4
+    D1 -- "都不是" --> D5
+    D2 --> T1
+    D3 --> T2
+    D4 --> T3
+    D4 --> T4
+    D4 --> T5
+    D4 --> T6
+    D5 --> C4
+    T1 --> C4
+    T2 --> C4
+    T3 --> C4
+    T4 --> C4
+    T5 --> C4
+    T6 --> C4
+    S1 -.-> T3
+    S1 -.-> T4
+    S1 -.-> T5
+    S1 -.-> T6
+    S2 -.-> T6
+    S3 -.-> T6
+    S4 -.-> T4
+    S5 -.-> T5
