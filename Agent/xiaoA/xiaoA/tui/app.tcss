@@ -1,0 +1,64 @@
+/* xiaoA 终端界面样式（Textual CSS）
+ *
+ * 注意：.tcss 里不能写 Python 那种三引号注释，
+ * 必须用这种 C 风格注释，否则解析器会把注释当选择器。
+ * 也不能用双星号包住注释结尾——只认三个字符的斜杠星号组合。
+ */
+
+Screen {
+    background: $background;
+}
+
+#header-bar {
+    height: 1;
+    background: $panel;
+    color: $text;
+    padding: 0 1;
+}
+
+#header-bar.-title {
+    text-style: bold;
+}
+
+/* 消息区：一条消息一个 Message（Static），可滚动、可选中复制。
+ *
+ * 为什么不用 RichLog：它只能追加整行，写进去就改不了；
+ * 逐字输出必须能反复重写"最后那一条"，所以换成 VerticalScroll + Static。
+ */
+#transcript {
+    height: 1fr;
+    border: round $primary;
+    background: $surface;
+    padding: 0 1;
+    scrollbar-gutter: stable;
+}
+
+/* width 100% 必须写：否则 Static 会按内容撑宽，
+   长句不换行、整片往右溢出，只能横向拖着看。 */
+#transcript > .msg {
+    width: 100%;
+    height: auto;
+}
+
+#status {
+    height: 1;
+    background: $panel;
+    color: $text-muted;
+    padding: 0 1;
+}
+
+#composer {
+    height: 3;
+    border: round $primary;
+    padding: 0 1;
+}
+
+#composer:focus {
+    border: round $accent;
+}
+
+#hint {
+    height: 1;
+    color: $text-muted;
+    padding: 0 1;
+}

@@ -1,0 +1,16 @@
+# 本地配置里有 API Key，不进仓库
+config.ini
+
+# Python 运行时产物
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+
+# 测试与工具产物
+.pytest_cache/
+.coverage
+htmlcov/
+.mypy_cache/
+.ruff_cache/
