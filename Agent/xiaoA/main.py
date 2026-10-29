@@ -26,6 +26,7 @@ if ROOT not in sys.path:
 def check_core(config_path=None) -> int:
     """--check：不启动界面，只验证 core 是否能装配起来。"""
     from xiaoA.core.config import ConfigError, load_config
+    from xiaoA.core.skills import discover_skills
     from xiaoA.core.tools import build_default_registry
 
     try:
@@ -34,6 +35,7 @@ def check_core(config_path=None) -> int:
         print("[配置错误] %s" % e)
         return 1
     reg = build_default_registry()
+    catalog = discover_skills()      # 以启动时的工作目录为项目根
     print("配置 OK：模型 %s ｜ 接口 %s ｜ Key %s"
           % (cfg.model, cfg.base_url, cfg.masked_key()))
     if cfg.search_ready:
@@ -51,6 +53,9 @@ def check_core(config_path=None) -> int:
     print("本地命令：超时 %g 秒 ｜ stdout/stderr 各上限 %d 字符 ｜ 不设命令白名单（教学阶段）"
           % (cfg.cli_timeout, cfg.cli_max_chars))
     print("工具 %d 个：%s" % (len(reg), "、".join(reg.names())))
+    print(catalog.summary())
+    for problem in catalog.problems:
+        print("技能提醒：%s" % problem)
     return 0
 
 

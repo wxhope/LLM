@@ -29,6 +29,7 @@ from .events import (
 )
 from .llm import AssistantMessage, LLMClient, LLMError, StreamDelta, ToolCall
 from .ports import ConfirmPort, EventSink
+from .skills import SkillCatalog, discover_skills
 from .tools import DangerLevel, ToolContext, ToolRegistry, build_default_registry
 
 SYSTEM_PROMPT = (
@@ -47,6 +48,28 @@ SYSTEM_PROMPT = (
     "RunCli 会返回退出码、stdout 和 stderr：退出码不为 0 就是没跑成，"
     "先按 stderr 里的原因调整，不要拿同样的参数重复调用。"
 )
+
+# 有技能时拼在基础提示词后面。清单只给 name 和 description（注册阶段就这些），
+# 完整说明让模型自己用 loadSkill 按需取。
+SKILL_PROMPT_SECTION = (
+    "\n\nYou have access to the following skills:\n"
+    "%s\n"
+    'Use the "loadSkill" tool to load the full instructions of a skill when needed. '
+    "You can also load additional files referenced by a skill: "
+    "传 loadSkill 的 filename 参数（支持技能目录内相对路径、项目相对路径、"
+    "绝对路径或裸文件名）。"
+    "任务和某个技能的 description 对得上、或用户点名要用某个技能时，"
+    "先 loadSkill 拿到完整指引再动手；只是顺便一提的事不必加载。"
+)
+
+
+def build_system_prompt(skills: Optional[SkillCatalog] = None) -> str:
+    """组装系统提示词：无技能返回原文；有技能追加 name/description 清单。"""
+    if not skills or not skills.skills:
+        return SYSTEM_PROMPT
+    listing = "\n".join(
+        '- "%s"：%s' % (s.name, s.description) for s in skills.skills)
+    return SYSTEM_PROMPT + SKILL_PROMPT_SECTION % listing
 
 
 @dataclass
@@ -69,6 +92,7 @@ class Session:
         sink: Optional[EventSink] = None,
         confirm: Optional[ConfirmPort] = None,
         allow_tools: bool = True,
+        skills: Optional[SkillCatalog] = None,
     ) -> None:
         self.config = config
         # 依赖全部从外部注入，默认值只是"常用的那一套"
@@ -77,6 +101,12 @@ class Session:
         self.sink = sink
         self.confirm = confirm
         self.allow_tools = allow_tools
+        # 技能发现与注册：初始化阶段只读 name/description，正文按需再说。
+        # 传进来的 catalog 优先（测试时好替换）；找不到技能目录就得到空表，
+        # 不报错——没有技能是常态，不是故障。
+        self.skills = skills if skills is not None else discover_skills()
+        # 系统提示词在初始化时拼好一次：技能清单来自注册表，注册表不在会话中途变
+        self._system_prompt = build_system_prompt(self.skills)
 
         # messages 里不放 system：它每次请求时临时拼在最前面，
         # 这样历史裁剪不用考虑它的位置
@@ -235,6 +265,7 @@ class Session:
             fetch_max_chars=self.config.fetch_max_chars,
             cli_timeout=self.config.cli_timeout,
             cli_max_chars=self.config.cli_max_chars,
+            skills=self.skills,
             config_path=self.config.config_path,
         )
         for i, call in enumerate(calls):
@@ -281,7 +312,7 @@ class Session:
     # ---------------------------------------------------------------- 历史管理
 
     def _build_messages(self) -> List[Dict[str, Any]]:
-        return [{"role": "system", "content": SYSTEM_PROMPT}] + self.messages
+        return [{"role": "system", "content": self._system_prompt}] + self.messages
 
     def _trim_history(self) -> None:
         """超长历史按 user 边界整组丢弃。
@@ -316,4 +347,5 @@ def build_session(config: AppConfig, sink: Optional[EventSink] = None,
     return Session(config, sink=sink, confirm=confirm, allow_tools=allow_tools)
 
 
-__all__ = ["Session", "TurnStats", "SYSTEM_PROMPT", "build_session"]
+__all__ = ["Session", "TurnStats", "SYSTEM_PROMPT", "build_session",
+           "build_system_prompt", "SKILL_PROMPT_SECTION"]

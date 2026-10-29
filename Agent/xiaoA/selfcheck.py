@@ -16,7 +16,7 @@ import tempfile
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from xiaoA.core.llm.stream import parse_line
-from xiaoA.core.tools import ToolContext, build_default_registry
+from xiaoA.core.tools import ToolContext, ToolRegistry, build_default_registry
 from xiaoA.core.tools.builtin.math_ops import is_leap_year
 from xiaoA.core.tools.builtin.fetch_web import (
     FetchError,
@@ -40,8 +40,8 @@ Q = lambda p: p.replace("\\", "\\\\")   # 拼 JSON 时转义反斜杠
 
 def main() -> int:
     reg = build_default_registry()
-    assert len(reg) == 15, "内置工具应有 15 个，实际 %d" % len(reg)
-    assert len(reg.schemas()) == 15
+    assert len(reg) == 16, "内置工具应有 16 个，实际 %d" % len(reg)
+    assert len(reg.schemas()) == 16
     print("工具清单（%d）：%s" % (len(reg), "、".join(reg.names())))
 
     denied = ToolContext(max_read_chars=200, confirm=lambda t, m: False)
@@ -301,6 +301,179 @@ def main() -> int:
     cut, removed = truncate_middle("a" * 1000, 300)
     assert removed > 0 and "中间省略" in cut and cut.startswith("a")
     print("RunCli 误用提示 / 截断函数 -> 全对")
+
+    # ---- Skill 发现与注册：只读 name/description，坏目录要留原因、不能炸
+    from xiaoA.core.skills import SkillCatalog, discover_skills, parse_frontmatter
+
+    fm = parse_frontmatter("---\nname: a\ndescription: 带冒号：的值\n---\n正文")
+    assert fm["name"] == "a" and fm["description"] == "带冒号：的值", fm
+    fm = parse_frontmatter("---\r\nname: 'b'\r\ndescription: \"c\"\r\n---\r\n")
+    assert fm["name"] == "b" and fm["description"] == "c", fm
+    for bad_text in ("没有 frontmatter", "---\nname: a\n"):
+        try:
+            parse_frontmatter(bad_text)
+        except ValueError:
+            pass
+        else:
+            raise AssertionError("坏 frontmatter 没被挡住：%r" % bad_text)
+    print("SKILL.md Frontmatter 解析 -> 冒号 / 引号 / CRLF / 两种坏格式 全对")
+
+    # 用临时目录搭一个真实的 .agents/skills 布局来扫
+    skill_root = os.path.join(tempfile.gettempdir(), "xiaoA_skills_case")
+    mk = lambda *p: os.path.join(skill_root, ".agents", "skills", *p)  # noqa: E731
+    import shutil
+    shutil.rmtree(skill_root, ignore_errors=True)
+    os.makedirs(mk("good"))
+    with open(mk("good", "SKILL.md"), "w", encoding="utf-8") as f:
+        # 正文写到 1000 字符以上：loadSkill 的截断下限是 1000，太短测不到截断分支
+        f.write("---\nname: good\ndescription: 正常技能\n---\n" + "正文很多字" * 250)
+    # 技能内附件：测 filename 的各种解析方式
+    os.makedirs(mk("good", "scripts"))
+    with open(mk("good", "scripts", "run.py"), "w", encoding="utf-8") as f:
+        f.write("print('skill script ok')\n")
+    with open(mk("good", "guide.md"), "w", encoding="utf-8") as f:
+        f.write("# 技能附件说明\n")
+    os.makedirs(mk("good", "sub"))
+    with open(mk("good", "dup.txt"), "w", encoding="utf-8") as f:
+        f.write("dup A\n")
+    with open(mk("good", "sub", "dup.txt"), "w", encoding="utf-8") as f:
+        f.write("dup B\n")
+    with open(mk("good", "blob.bin"), "wb") as f:
+        f.write(b"\x00\x01binary")
+    os.makedirs(mk("no_md"))                                   # 没有 SKILL.md
+    os.makedirs(mk("no_desc"))                                 # 缺 description
+    os.makedirs(mk("bad_fm"))                                  # frontmatter 没闭合
+    os.makedirs(mk("not-equal"))                               # name 和目录名不一致
+    with open(mk("not-equal", "SKILL.md"), "w", encoding="utf-8") as f:
+        f.write("---\nname: other\ndescription: x\n---\n")
+
+    catalog = discover_skills(skill_root)
+    assert [s.name for s in catalog.skills] == ["good", "other"], catalog.names()
+    good = catalog.get("good")
+    assert good is not None and good.path.endswith("SKILL.md")
+    # 正文不能进元信息：SkillMeta 里根本没有正文字段，注册内容只到描述为止
+    assert "正文很多字" not in repr(good)
+    joined = "；".join(catalog.problems)
+    for key in ("no_md", "no_desc", "bad_fm"):
+        assert key in joined, "问题清单里没有 %s：%s" % (key, joined)
+    assert any("目录名不一致" in p for p in catalog.problems), catalog.problems
+    assert discover_skills(os.path.join(skill_root, "不存在的目录")).root == ""
+
+    # Session 初始化要自动注册：传进来的 catalog 优先，缺省时自己扫
+    from xiaoA.core.config import AppConfig
+    from xiaoA.core.session import Session
+
+    def fake_client():
+        return type("C", (), {"chat_stream": staticmethod(lambda *a, **k: iter([]))})()
+
+    sess = Session(AppConfig(api_key="sk-test", base_url="https://x.invalid", model="m"),
+                   client=fake_client(), registry=ToolRegistry([]), skills=catalog)
+    assert sess.skills.get("good") is not None
+    empty = Session(AppConfig(api_key="sk-test", base_url="https://x.invalid", model="m"),
+                    client=fake_client(), registry=ToolRegistry([]),
+                    skills=SkillCatalog())
+    assert len(empty.skills) == 0
+    print("Skill 发现与注册 -> 只取元信息 / 坏目录留原因 / 缺目录不炸 / Session 自动挂载")
+
+    # ---- loadSkill + System Prompt 注入：清单进提示词，正文按需取
+    from xiaoA.core.session import build_system_prompt
+
+    # 没技能：提示词原样，不出现 loadSkill 字样
+    assert build_system_prompt(None) == build_system_prompt(SkillCatalog())
+    assert "loadSkill" not in build_system_prompt(None)
+    # 有技能：清单里要有 name 和 description
+    prompt = build_system_prompt(catalog)          # 复用上面扫出来的 good/other
+    assert '"good"' in prompt and "正常技能" in prompt, prompt[-400:]
+    assert "loadSkill" in prompt and "readFile" in prompt
+    print("System Prompt 注入 -> 无技能不加尾巴 / 有技能带 name+description 清单")
+
+    def cli_ctx(limit):
+        return ToolContext(max_read_chars=limit, confirm=lambda t, m: False,
+                           skills=catalog)
+
+    # ---- 基础路径：name 必需、未知名、空注册表
+    res = reg.invoke("loadSkill", "{}", cli_ctx(20000))
+    assert not res.ok and "name 参数" in res.content, res.content
+    print("loadSkill 缺 name ->", res.content.splitlines()[0])
+
+    res = reg.invoke("loadSkill", '{"name": "nope"}', cli_ctx(20000))
+    assert not res.ok and "good" in res.content, res.content   # 提示里列出可用技能
+    print("loadSkill 未知技能 ->", res.content.splitlines()[0])
+
+    # 没有技能的 ctx：工具要说明现状，而不是抛异常
+    bare = ToolContext(max_read_chars=20000, confirm=lambda t, m: False)
+    res = reg.invoke("loadSkill", '{"name": "good"}', bare)
+    assert not res.ok and "没有任何已注册技能" in res.content, res.content
+    print("loadSkill 空注册表 ->", res.content.splitlines()[0])
+
+    # ---- 只给 name：SKILL.md 全文 + 截断
+    res = reg.invoke("loadSkill", '{"name": "good"}', cli_ctx(20000))
+    assert res.ok and "---" in res.content and "正文很多字" in res.content, res.content[:200]
+    print("loadSkill 只传 name -> 返回 SKILL.md 全文（frontmatter + 正文）")
+
+    res = reg.invoke("loadSkill", '{"name": "good"}', cli_ctx(50))
+    assert res.ok and "已截断" in res.content, res.content[:200]
+    print("loadSkill 截断 ->", res.content.splitlines()[-1])
+
+    # ---- filename：技能目录相对路径
+    res = reg.invoke("loadSkill", '{"name": "good", "filename": "scripts/run.py"}',
+                     cli_ctx(20000))
+    assert res.ok and "skill script ok" in res.content, res.content[:200]
+    assert "正文很多字" not in res.content                      # 不重复带 SKILL.md
+    print("loadSkill filename 技能相对路径 -> 只返回该文件，不带 SKILL.md")
+
+    # ---- 项目相对路径（项目根 = .agents 的上两级）
+    res = reg.invoke("loadSkill",
+                     '{"name": "good", "filename": ".agents/skills/good/guide.md"}',
+                     cli_ctx(20000))
+    assert res.ok and "技能附件说明" in res.content, res.content[:200]
+    print("loadSkill filename 项目相对路径 -> 命中")
+
+    # ---- 绝对路径：目录内放行，目录外拒绝
+    inside = mk("good", "scripts", "run.py")
+    res = reg.invoke("loadSkill",
+                     json.dumps({"name": "good", "filename": inside}), cli_ctx(20000))
+    assert res.ok and "skill script ok" in res.content, res.content[:200]
+    outside = os.path.join(skill_root, "outside_secret.txt")
+    with open(outside, "w", encoding="utf-8") as f:
+        f.write("不应被读到\n")
+    res = reg.invoke("loadSkill",
+                     json.dumps({"name": "good", "filename": outside}), cli_ctx(20000))
+    assert not res.ok and "越界" in res.content, res.content
+    print("loadSkill filename 绝对路径 -> 目录内放行 / 目录外拒绝越界")
+
+    # ---- ../ 穿越：即使最终写法看着温和，解析出目录也必须挡
+    res = reg.invoke("loadSkill",
+                     '{"name": "good", "filename": "../no_md/SKILL.md"}',
+                     cli_ctx(20000))
+    assert not res.ok, "穿越到别的技能目录没有被挡下"
+    print("loadSkill filename ../ 穿越 -> 拒绝")
+
+    # ---- 裸文件名：唯一命中直接读；同名多个给候选清单
+    res = reg.invoke("loadSkill", '{"name": "good", "filename": "run.py"}',
+                     cli_ctx(20000))
+    assert res.ok and "skill script ok" in res.content, res.content[:200]
+    print("loadSkill filename 裸文件名（唯一） -> 递归搜索后直接读")
+
+    res = reg.invoke("loadSkill", '{"name": "good", "filename": "dup.txt"}',
+                     cli_ctx(20000))
+    assert not res.ok and "dup.txt" in res.content and "sub/dup.txt" in res.content \
+        and "2 个位置" in res.content, res.content
+    assert res.content.count("dup") >= 2                       # 两个候选都在
+    print("loadSkill filename 裸文件名（多个同名） -> 返回候选路径由模型决定")
+
+    res = reg.invoke("loadSkill", '{"name": "good", "filename": "不存在.py"}',
+                     cli_ctx(20000))
+    assert not res.ok and "递归搜索" in res.content, res.content
+    print("loadSkill filename 找不到 -> 说明已递归搜索过")
+
+    # ---- 二进制文件：拒绝读成文本，提示走 RunCli
+    res = reg.invoke("loadSkill", '{"name": "good", "filename": "blob.bin"}',
+                     cli_ctx(20000))
+    assert not res.ok and "二进制" in res.content, res.content
+    print("loadSkill filename 二进制文件 -> 拒绝并建议 RunCli")
+
+    shutil.rmtree(skill_root, ignore_errors=True)
 
     # ---- 分层检查：core 绝不能出现界面依赖
     for mod_name, mod in list(sys.modules.items()):

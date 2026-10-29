@@ -187,6 +187,10 @@ class XiaoAApp(App):
         self._type_delay = self.config_obj.type_delay
         self.write_notice(
             "就绪。工具 %d 个，模型 %s。" % (len(registry), self.config_obj.model))
+        if self.session.skills:
+            self.write_notice(self.session.skills.summary())
+            for problem in self.session.skills.problems:
+                self.write_notice("技能提醒：%s" % problem)
         self.set_status("空闲")
         self.query_one("#composer", Input).focus()
 

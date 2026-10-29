@@ -16,7 +16,10 @@ from __future__ import annotations
 
 import enum
 from dataclasses import dataclass, field
-from typing import Any, Callable, Dict, List, Optional
+from typing import TYPE_CHECKING, Any, Callable, Dict, List, Optional
+
+if TYPE_CHECKING:                       # 只是类型标注，运行时不产生依赖
+    from ..skills import SkillCatalog
 
 
 class DangerLevel(str, enum.Enum):
@@ -49,6 +52,10 @@ class ToolContext:
     # ---- 跑本地命令：超时和 stdout/stderr 各自的上限
     cli_timeout: float = 30.0
     cli_max_chars: int = 4000
+
+    # ---- 技能注册表：loadSkill 靠它把 SKILL.md 全文取出来。
+    # None / 空表 = 没有技能，工具会如实说明，而不是猜。
+    skills: Optional["SkillCatalog"] = None
 
     def ask(self, title: str, message: str) -> bool:
         """问用户。没有确认口就返回 False —— 宁可不动手，也不擅自删。"""

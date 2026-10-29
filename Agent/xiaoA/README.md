@@ -32,12 +32,17 @@ xiaoA/
 ├── selfcheck.py                离线自检，不联网、不装界面库也能跑
 ├── requirements.txt            只有 TUI 需要的 textual
 ├── config.example.ini
+├── .agents/                    Skill 目录（项目根下，随仓库走）
+│   └── skills/
+│       └── example-hello/     示例技能，看懂后可删
+│           └── SKILL.md
 └── xiaoA/
     ├── core/                   ★ 业务核心（纯标准库）
     │   ├── config.py           读 ini → AppConfig，出错抛 ConfigError
     │   ├── events.py           往 UI 发的消息（TextDelta / ToolCallStarted / ...）
     │   ├── ports.py            对 UI 提的能力要求（EventSink / ConfirmPort）
     │   ├── session.py          对话编排：tool-calling 主循环
+    │   ├── skills.py           Skill 发现与注册（只读 name/description）
     │   ├── llm/
     │   │   ├── client.py       唯一碰 http.client 的地方
     │   │   ├── stream.py       SSE 解析（纯函数，好测）
@@ -51,6 +56,7 @@ xiaoA/
     │           ├── datetime_ops.py getDate
     │           ├── math_ops.py    isLeapYear
     │           ├── cli_ops.py     RunCli（调本机任意命令行程序）
+    │           ├── skill_ops.py  loadSkill（按需加载 SKILL.md 全文或技能内文件）
     │           ├── web_search.py  searchWe（联网搜索，百度千帆）
     │           ├── fetch_web.py   FetchWeb（抓网页正文 → Markdown，走本机 curl）
     │           └── fs_ops.py      10 个文件操作
@@ -139,11 +145,11 @@ python -m venv .venv
 **3. `scroll_end` 要传 `force=True`。** 它内部有"内容没变就不滚"的判断，而那个判断
 有缓存，靠不住。
 
-## 工具清单（15 个）
+## 工具清单（16 个）
 
 时间 `getDate`（调本机 date 命令）｜计算 `isLeapYear`｜
 联网 `searchWe`（搜索）`FetchWeb`（读网页正文）｜
-执行 `RunCli`（调任意本机命令行程序）｜
+执行 `RunCli`（调任意本机命令行程序）｜技能 `loadSkill`（按需取技能全文/附件）｜
 文件 `getCwd` `listDir` `getFileType` `readFile` `createFile` `createDir`
 `editFile` `renamePath` `deleteDir`⚠ `deleteFile`⚠
 
@@ -345,6 +351,65 @@ max_chars = 4000    # stdout 和 stderr 各自的上限
 1. 把工具声明里的 `danger=DangerLevel.SAFE` 改成 `DESTRUCTIVE`——
    `session.py` 会自动在每条命令执行前弹确认口（就是删除文件用的那个）。
 2. 在 `build_argv()` 前面加一层白名单，只放行 `git` `python` `npm` 这类。
+
+## Skill 发现与注册
+
+对齐 Agent Skills 规范的最小子集：xiaoA 初始化时，以**程序启动时的工作目录**为项目
+根目录，扫描 `.agents\skills\` 下的各个技能子目录。每个子目录至少要有一个 `SKILL.md`，
+开头用 YAML Frontmatter 声明必需的 `name` 和 `description` 两个字段：
+
+```markdown
+---
+name: example-hello
+description: 一句话说清这个技能是干什么的
+---
+
+（正文，初始化阶段一个字都不读）
+```
+
+两条刻意的限制：
+
+- **初始化只读元信息。** frontmatter 解析只取文件前 64 KB、只留 name 和 description，
+  正文有多长都不碰——技能清单是给"知道有什么"用的，不是给"全部背下来"用的。
+  完整说明由模型在需要时用 `loadSkill` 取，见下文。
+- **坏技能不炸程序。** 没有 SKILL.md、缺字段、frontmatter 没闭合的目录，落选原因
+  写进 `SkillCatalog.problems`，其余技能照常注册；连 `.agents/skills` 目录本身
+  不存在也只是得到空表。技能缺失是常态，不是故障。
+
+frontmatter 解析是纯标准库的手写实现（只支持 `key: value` 这一层），不为它引入
+pyyaml。`Session` 初始化时自动扫描并挂载；`main.py --check` 和 TUI 启动横幅会打印
+`技能（N）：a、b` 和每条落选原因。示例技能在 `.agents/skills/example-hello/`，
+看懂后删掉整个目录即可。
+
+### 注入 System Prompt 与按需加载
+
+发现技能后，`session.build_system_prompt()` 会在基础提示词后追加一段清单：
+
+```
+You have access to the following skills:
+- "example-hello"：示例技能——演示 .agents/skills 的目录布局……
+Use the "loadSkill" tool to load the full instructions of a skill when needed.
+You can also load additional files referenced by a skill.
+```
+
+- **无技能时一个字都不加**：`loadSkill` 这些字样不会出现在提示词里，模型根本
+  不知道有这回事，也就不会去调一个必然失败的工具。
+- **`loadSkill`（core/tools/builtin/skill_ops.py）** 两个参数：
+  - `name`（必需）：技能名。只传它 → 返回该技能 SKILL.md 全文；
+  - `filename`（可选）：技能内的具体文件。传了就只读那个文件，不重复带 SKILL.md。
+    解析顺序：技能目录内相对路径 → 项目相对路径 → 绝对路径（仅限落在技能目录内的）
+    → 裸文件名（技能目录内递归搜索：唯一命中直接读，多个同名返回候选路径由模型
+    决定，没有命中说明已搜过）。
+  - 失败都不抛异常：缺参数、未知技能、空注册表、路径越界、二进制文件，各自返回
+    带现状说明和下一步建议的错误文本。
+- **安全边界：读文件的范围锁死在该技能目录内。** 所有路径先 realpath 解析再核对
+  归属，`../` 穿越和指向目录外的绝对路径一律拒绝——技能文件再怎么翻也翻不出
+  自己的目录。其他文件的读取走现成的 readFile（有自己的防线），二进制附件提示
+  用 RunCli 执行而不是读成乱码。
+- **动态加载原则**：SKILL.md 和附件的内容只有在模型调用 loadSkill 时才进入对话
+  上下文；单次加载受 `max_read_chars` 约束，超长截断并标明总量。
+  loadSkill 返回的脚本文本，模型交给 RunCli 执行、结果再用文件工具落盘——
+  与现有工具就是普通的多轮 tool-calling 协作，工作流程没有任何特判。
 
 ## 加一个新工具
 
