@@ -56,3 +56,9 @@ desktop.ini
 *.log
 tmp/
 temp/
+
+# ---------- xiaoA：技能与测试产物只留本地，不进仓库 ----------
+# 技能是各机器本地的工作区内容（SKILL.md/脚本），不同步
+Agent/xiaoA/.agents/skills/*
+# 测试运行时生成的 Word 文档等产物
+Agent/xiaoA/*.docx
