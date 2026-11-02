@@ -44,8 +44,7 @@ from ..core.events import (
     ToolCallFinished,
     ToolCallStarted,
 )
-from ..core.session import Session
-from ..core.tools import build_default_registry
+from ..core.session import Session, build_session
 from .bridge import QueueSink, TextualConfirm
 
 # 队列轮询间隔（秒）。40ms ≈ 25fps，看着顺滑又不浪费 CPU
@@ -171,13 +170,9 @@ class XiaoAApp(App):
         # 2) 装配 core：注入 sink 与 confirm，session 本身不知道 Textual 存在。
         #    已经预置了 session 的（测试 / 自定义客户端）不覆盖，只补上 sink。
         if self.session is None:
-            registry = build_default_registry()
-            self.session = Session(
-                self.config_obj,
-                registry=registry,
-                sink=self.sink,
-                confirm=self.confirm_port,
-            )
+            self.session = build_session(
+                self.config_obj, sink=self.sink, confirm=self.confirm_port)
+            registry = self.session.registry
         else:
             self.session.sink = self.sink
             self.session.confirm = self.confirm_port
@@ -191,6 +186,10 @@ class XiaoAApp(App):
             self.write_notice(self.session.skills.summary())
             for problem in self.session.skills.problems:
                 self.write_notice("技能提醒：%s" % problem)
+        if self.session.mcp is not None:
+            self.write_notice(self.session.mcp.summary)
+            for problem in self.session.mcp.problems:
+                self.write_notice("MCP提醒：%s" % problem)
         self.set_status("空闲")
         self.query_one("#composer", Input).focus()
 

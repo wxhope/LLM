@@ -13,6 +13,7 @@
 
 from __future__ import annotations
 
+import os
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional
 
@@ -28,6 +29,7 @@ from .events import (
     TokenUsage,
 )
 from .llm import AssistantMessage, LLMClient, LLMError, StreamDelta, ToolCall
+from .mcp import McpManager, load_mcp_manager
 from .ports import ConfirmPort, EventSink
 from .skills import SkillCatalog, discover_skills
 from .tools import DangerLevel, ToolContext, ToolRegistry, build_default_registry
@@ -93,11 +95,16 @@ class Session:
         confirm: Optional[ConfirmPort] = None,
         allow_tools: bool = True,
         skills: Optional[SkillCatalog] = None,
+        mcp: Optional[McpManager] = None,
     ) -> None:
         self.config = config
         # 依赖全部从外部注入，默认值只是"常用的那一套"
         self.client = client or LLMClient(config.base_url, config.api_key)
-        self.registry = registry if registry is not None else build_default_registry()
+        self.registry = registry if registry is not None else build_default_registry(
+            extra=mcp.tools if mcp else None)
+        # MCP：外部 Server 提供的工具已在上面并入注册表；
+        # manager 本身留着——横幅要显示连接情况，退出时要关连接。
+        self.mcp = mcp
         self.sink = sink
         self.confirm = confirm
         self.allow_tools = allow_tools
@@ -265,7 +272,11 @@ class Session:
             fetch_max_chars=self.config.fetch_max_chars,
             cli_timeout=self.config.cli_timeout,
             cli_max_chars=self.config.cli_max_chars,
+            mcp_call_timeout=self.config.mcp_call_timeout,
+            mcp_max_chars=self.config.mcp_max_chars,
             skills=self.skills,
+            # createSkill 建完目录后靠它重扫，新技能当场可用
+            refresh_skills=self.refresh_skills,
             config_path=self.config.config_path,
         )
         for i, call in enumerate(calls):
@@ -309,6 +320,24 @@ class Session:
             return False
         return bool(self.confirm.ask(title, message))
 
+    # ---------------------------------------------------------------- 技能刷新
+
+    def refresh_skills(self) -> Optional[SkillCatalog]:
+        """重扫 .agents/skills，刷新技能清单和系统提示词。
+
+        系统提示词原本只在 __init__ 里拼一次，清单来自启动时那次扫描——
+        于是 createSkill 建出来的技能"当场看不见"，模型接着 loadSkill
+        只会被告知没有这个技能。这里把重扫收成一个方法，通过
+        ToolContext.refresh_skills 交给工具调用；工具不必知道 Session 存在。
+        """
+        base: Optional[str] = None
+        if self.skills is not None and self.skills.root:
+            # root 是 <项目>/.agents/skills，往上两级才是项目根
+            base = os.path.dirname(os.path.dirname(self.skills.root))
+        self.skills = discover_skills(base)
+        self._system_prompt = build_system_prompt(self.skills)
+        return self.skills
+
     # ---------------------------------------------------------------- 历史管理
 
     def _build_messages(self) -> List[Dict[str, Any]]:
@@ -343,8 +372,17 @@ class Session:
 def build_session(config: AppConfig, sink: Optional[EventSink] = None,
                   confirm: Optional[ConfirmPort] = None,
                   allow_tools: bool = True) -> Session:
-    """给界面用的便捷构造函数：注册表默认全量内置工具。"""
-    return Session(config, sink=sink, confirm=confirm, allow_tools=allow_tools)
+    """给界面用的便捷构造函数。
+
+    内置工具全量 + MCP：启动目录有 .mcp.json 就连接外部 Server 并把远端
+    工具并入注册表；没有就跳过，一行多余的活都不干。
+    """
+    mcp = load_mcp_manager(
+        connect_timeout=config.mcp_connect_timeout,
+        call_timeout=config.mcp_call_timeout,
+    )
+    return Session(config, sink=sink, confirm=confirm, allow_tools=allow_tools,
+                   mcp=mcp)
 
 
 __all__ = ["Session", "TurnStats", "SYSTEM_PROMPT", "build_session",

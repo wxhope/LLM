@@ -53,9 +53,19 @@ class ToolContext:
     cli_timeout: float = 30.0
     cli_max_chars: int = 4000
 
+    # ---- MCP 远端工具：单次调用的等待秒数和返回文本上限
+    mcp_call_timeout: float = 60.0
+    mcp_max_chars: int = 8000
+
     # ---- 技能注册表：loadSkill 靠它把 SKILL.md 全文取出来。
     # None / 空表 = 没有技能，工具会如实说明，而不是猜。
     skills: Optional["SkillCatalog"] = None
+
+    # ---- 技能目录变了，让会话层重扫一遍并重建系统提示词。
+    # createSkill 刚写完一个新技能时调它：不重扫的话，新技能要等到下次
+    # 启动才进清单，模型当场 loadSkill 只会得到"没有这个技能"。
+    # 没挂这个回调（比如自检里手搓的 ctx）= 只能如实告诉模型"重启后生效"。
+    refresh_skills: Optional[Callable[[], Optional["SkillCatalog"]]] = None
 
     def ask(self, title: str, message: str) -> bool:
         """问用户。没有确认口就返回 False —— 宁可不动手，也不擅自删。"""

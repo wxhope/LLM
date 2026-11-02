@@ -29,10 +29,16 @@ DEFAULT_FETCH_MAX_CHARS = 12000
 DEFAULT_CLI_TIMEOUT = 30.0
 DEFAULT_CLI_MAX_CHARS = 4000
 
+# MCP 客户端的默认值（.mcp.json 里的 Streamable HTTP 服务器）
+DEFAULT_MCP_CONNECT_TIMEOUT = 10.0
+DEFAULT_MCP_CALL_TIMEOUT = 60.0
+DEFAULT_MCP_MAX_CHARS = 8000
+
 REQUIRED_SECTION = "deepseek"
 SEARCH_SECTION = "search"
 FETCH_SECTION = "fetch"
 CLI_SECTION = "cli"
+MCP_SECTION = "mcp"
 
 # 占位符：填这几个等于没填
 _PLACEHOLDERS = ("你的key", "你的百度千帆key", "your_api_key", "xxx")
@@ -62,6 +68,10 @@ class AppConfig:
     # 本地命令：超时 + stdout/stderr 各自的上限
     cli_timeout: float = DEFAULT_CLI_TIMEOUT
     cli_max_chars: int = DEFAULT_CLI_MAX_CHARS
+    # MCP 远端工具：连接握手、单次调用、返回文本上限
+    mcp_connect_timeout: float = DEFAULT_MCP_CONNECT_TIMEOUT
+    mcp_call_timeout: float = DEFAULT_MCP_CALL_TIMEOUT
+    mcp_max_chars: int = DEFAULT_MCP_MAX_CHARS
 
     def masked_key(self) -> str:
         """给界面展示用：只露头尾，别把 key 打在屏幕上。"""
@@ -205,6 +215,30 @@ def load_config(path: Optional[str] = None) -> AppConfig:
             except ValueError:
                 raise ConfigError("配置里的 [%s] max_chars 不是整数：%s" % (CLI_SECTION, raw))
 
+    # ---- MCP 同样可选：[mcp] 段缺失时全部走默认值
+    mcp_connect_timeout = DEFAULT_MCP_CONNECT_TIMEOUT
+    mcp_call_timeout = DEFAULT_MCP_CALL_TIMEOUT
+    mcp_max_chars = DEFAULT_MCP_MAX_CHARS
+    if cfg.has_section(MCP_SECTION):
+        raw = (cfg.get(MCP_SECTION, "connect_timeout", fallback="") or "").strip()
+        if raw:
+            try:
+                mcp_connect_timeout = float(raw)
+            except ValueError:
+                raise ConfigError("配置里的 [%s] connect_timeout 不是数字：%s" % (MCP_SECTION, raw))
+        raw = (cfg.get(MCP_SECTION, "call_timeout", fallback="") or "").strip()
+        if raw:
+            try:
+                mcp_call_timeout = float(raw)
+            except ValueError:
+                raise ConfigError("配置里的 [%s] call_timeout 不是数字：%s" % (MCP_SECTION, raw))
+        raw = (cfg.get(MCP_SECTION, "max_chars", fallback="") or "").strip()
+        if raw:
+            try:
+                mcp_max_chars = max(1000, int(raw))
+            except ValueError:
+                raise ConfigError("配置里的 [%s] max_chars 不是整数：%s" % (MCP_SECTION, raw))
+
     return AppConfig(
         api_key=api_key,
         base_url=base_url.rstrip("/"),
@@ -221,4 +255,7 @@ def load_config(path: Optional[str] = None) -> AppConfig:
         fetch_max_chars=fetch_max_chars,
         cli_timeout=cli_timeout,
         cli_max_chars=cli_max_chars,
+        mcp_connect_timeout=mcp_connect_timeout,
+        mcp_call_timeout=mcp_call_timeout,
+        mcp_max_chars=mcp_max_chars,
     )

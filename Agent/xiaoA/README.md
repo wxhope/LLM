@@ -43,6 +43,7 @@ xiaoA/
     │   ├── ports.py            对 UI 提的能力要求（EventSink / ConfirmPort）
     │   ├── session.py          对话编排：tool-calling 主循环
     │   ├── skills.py           Skill 发现与注册（只读 name/description）
+    │   ├── mcp.py              MCP Client：连接外部 Server，工具动态并入注册表
     │   ├── llm/
     │   │   ├── client.py       唯一碰 http.client 的地方
     │   │   ├── stream.py       SSE 解析（纯函数，好测）
@@ -56,7 +57,7 @@ xiaoA/
     │           ├── datetime_ops.py getDate
     │           ├── math_ops.py    isLeapYear
     │           ├── cli_ops.py     RunCli（调本机任意命令行程序）
-    │           ├── skill_ops.py  loadSkill（按需加载 SKILL.md 全文或技能内文件）
+    │           ├── skill_ops.py   loadSkill（按需加载全文/附件）+ createSkill（新建技能）
     │           ├── web_search.py  searchWe（联网搜索，百度千帆）
     │           ├── fetch_web.py   FetchWeb（抓网页正文 → Markdown，走本机 curl）
     │           └── fs_ops.py      10 个文件操作
@@ -145,17 +146,20 @@ python -m venv .venv
 **3. `scroll_end` 要传 `force=True`。** 它内部有"内容没变就不滚"的判断，而那个判断
 有缓存，靠不住。
 
-## 工具清单（16 个）
+## 工具清单（17 个）
 
 时间 `getDate`（调本机 date 命令）｜计算 `isLeapYear`｜
 联网 `searchWe`（搜索）`FetchWeb`（读网页正文）｜
-执行 `RunCli`（调任意本机命令行程序）｜技能 `loadSkill`（按需取技能全文/附件）｜
+执行 `RunCli`（调任意本机命令行程序）｜
+技能 `loadSkill`（按需取技能全文/附件）`createSkill`（新建技能）｜
 文件 `getCwd` `listDir` `getFileType` `readFile` `createFile` `createDir`
 `editFile` `renamePath` `deleteDir`⚠ `deleteFile`⚠
 
 `searchWe` 找 URL，`FetchWeb` 读全文，两步配合才能既知道"有什么"又看清"具体写了什么"。
 `RunCli` 管"程序世界"：版本、构建、git、脚本；文件读写仍然走专用文件工具——
 后者有路径校验和删除确认，`RunCli` 没有。
+
+除此之外，**MCP 外部工具**会按 `.mcp.json` 动态并入这份清单（见下节）。
 
 ## 联网搜索（searchWe）
 
@@ -410,6 +414,65 @@ You can also load additional files referenced by a skill.
   上下文；单次加载受 `max_read_chars` 约束，超长截断并标明总量。
   loadSkill 返回的脚本文本，模型交给 RunCli 执行、结果再用文件工具落盘——
   与现有工具就是普通的多轮 tool-calling 协作，工作流程没有任何特判。
+
+### createSkill：让模型自己落盘一个技能
+
+用户说"给我做个 XX 技能"时，模型调 `createSkill(name, skillcontext)`，工具在
+`.agents/skills/<name>/` 下写好 `SKILL.md`。只做这一件事，附属文件交给
+`createDir` / `createFile`——职责单一，出错好定位。
+
+- **name 先规范化**：小写化，非 `[a-z0-9]` 的字符换成连字符，连续连字符合并，
+  去首尾连字符，最长 64。`"Weekly Report"` → `weekly-report`。纯中文名压完是空串，
+  直接拒绝并让模型给英文名——音译猜出来多半不是用户想要的。
+- **frontmatter 由工具保证合法**：skillcontext 自带 `---` 开头就解析它（坏格式
+  报错让模型重写，不替它猜）；没有就按 name 生成 `name`，`description` 取正文
+  第一句有效文字（跳过标题、代码块、表格）。`name` 一律以规范化后的目录名为准，
+  与目录名保持一致——这是 `discover_skills` 的注册前提。
+- **已存在就不写**：SKILL.md 已存在 / 目录非空但没 SKILL.md / 同名文件占位，
+  三种情况都拒绝并说明怎么改（`readFile` + `editFile`），绝不覆盖。
+- **建完当场可用**：通过 `ToolContext.refresh_skills` 回调触发
+  `Session.refresh_skills()`，重扫目录并重建系统提示词。不这么做的话，
+  新技能要等下次启动才进清单，模型马上 `loadSkill` 只会得到"没有这个技能"。
+  没挂回调时（自检里的裸 ctx）如实回"重启后生效"，不假装成功。
+- **返回里写清下一步**：文件绝对路径、实际的 description、能否直接 loadSkill、
+  加 `references/` `scripts/` 该用哪两个工具。模型不用猜。
+
+## MCP Client：挂载外部 MCP Server
+
+xiaoA 启动时读**启动目录**下的 `.mcp.json`（和技能扫描同一个"项目根"），
+按 MCP Python SDK 的 Streamable HTTP 协议连接外部 Server，把它们的工具
+动态注册进自己的工具集合。模型看到的就是普通 Function Calling 工具，
+完全感知不到背后是 MCP。
+
+### 配置（.mcp.json）
+
+```json
+{
+  "mcpServers": {
+    "PetHospital": { "url": "http://127.0.0.1:8090/mcp" }
+  }
+}
+```
+
+需要认证头时加 `headers`：`{"url": "...", "headers": {"Authorization": "Bearer xxx"}}`。
+模板见 `.mcp.example.json`；超时和返回上限在 config.ini 的 `[mcp]` 段。
+
+### 四步链路
+
+1. **读配置** `parse_mcp_config`：纯函数，坏项只进 problems 不炸程序；
+2. **连接+发现**：SDK 的 `streamable_http_client` + `ClientSession`，
+   持久连接跑在专属后台线程的事件循环里（SDK 是 asyncio 的，core 是同步的，
+   两个世界用 `run_coroutine_threadsafe` 对接）；
+3. **注册**：`list_tools()` 的每个工具包成本地 `Tool`。暴露名规则——
+   消毒后全集群唯一且不撞本地工具 → 裸名；否则加「服务器名__」前缀；
+   中文名（连"消毒成下划线"都做不到的）回退 `server` 并靠冲突规则兜底。
+4. **转发调用**：模型发起 tool_call 后按「暴露名 → (服务器, 原名)」映射转发；
+   文本内容直接拼、`structuredContent` 转 JSON 附后、`isError` 转 ok=False。
+
+### 失败哲学
+
+连不上的 Server 只进 problems（横幅/`--check` 一行说明原因），其余 Server、
+其余工具、整个对话完全不受影响。没装 `mcp` 库也一样：其他 17 个工具照常。
 
 ## 加一个新工具
 

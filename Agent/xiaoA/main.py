@@ -56,6 +56,24 @@ def check_core(config_path=None) -> int:
     print(catalog.summary())
     for problem in catalog.problems:
         print("技能提醒：%s" % problem)
+
+    # MCP：启动目录有 .mcp.json 就真连一遍（连接失败不挡检查，只报告）
+    from xiaoA.core.mcp import load_mcp_manager
+    try:
+        mcp = load_mcp_manager(
+            connect_timeout=cfg.mcp_connect_timeout,
+            call_timeout=cfg.mcp_call_timeout,
+        )
+    except Exception as e:                # noqa: BLE001 - 检查命令绝不能被 MCP 炸掉
+        mcp = None
+        print("MCP：检查时出现未预期错误（%s）" % e)
+    if mcp is None:
+        print("MCP：未配置（启动目录下没有 .mcp.json，不影响其他工具）")
+    else:
+        print(mcp.summary)
+        for problem in mcp.problems:
+            print("MCP提醒：%s" % problem)
+        mcp.shutdown()
     return 0
 
 

@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import sys
 import tempfile
 
@@ -40,8 +41,8 @@ Q = lambda p: p.replace("\\", "\\\\")   # 拼 JSON 时转义反斜杠
 
 def main() -> int:
     reg = build_default_registry()
-    assert len(reg) == 16, "内置工具应有 16 个，实际 %d" % len(reg)
-    assert len(reg.schemas()) == 16
+    assert len(reg) == 17, "内置工具应有 17 个，实际 %d" % len(reg)
+    assert len(reg.schemas()) == 17
     print("工具清单（%d）：%s" % (len(reg), "、".join(reg.names())))
 
     denied = ToolContext(max_read_chars=200, confirm=lambda t, m: False)
@@ -473,7 +474,162 @@ def main() -> int:
     assert not res.ok and "二进制" in res.content, res.content
     print("loadSkill filename 二进制文件 -> 拒绝并建议 RunCli")
 
+    # ---- createSkill：落盘 -> 规范化 -> 能被重扫发现 -> 重名/中文名/空参全挡
+    def read_skill(*parts):
+        with open(mk(*parts), encoding="utf-8") as f:
+            return f.read()
+
+    scans = []
+
+    def rescan():
+        cat = discover_skills(skill_root)
+        scans.append(cat)
+        return cat
+
+    maker = ToolContext(max_read_chars=20000, confirm=lambda t, m: False,
+                        skills=catalog, refresh_skills=rescan)
+
+    res = reg.invoke("createSkill", json.dumps({
+        "name": "Demo Skill",          # 大写 + 空格，必须被规范成 demo-skill
+        "skillcontext": "# 演示技能\n\n这个技能用来验证 createSkill 的落盘流程。",
+    }), maker)
+    assert res.ok and "已创建技能" in res.content, res.content
+    assert os.path.isfile(mk("demo-skill", "SKILL.md")), "SKILL.md 没落在 .agents/skills/demo-skill 下"
+    fm = parse_frontmatter(read_skill("demo-skill", "SKILL.md"))
+    assert fm["name"] == "demo-skill", fm                     # 目录名与 frontmatter 一致
+    assert fm["description"] == "这个技能用来验证 createSkill 的落盘流程。", fm
+    assert scans and scans[-1].get("demo-skill") is not None, "建完没重扫，模型当场 loadSkill 会扑空"
+    print("createSkill 无 frontmatter -> 名字规范化 / 自动补 description / 当场进清单")
+
+    # 自带 frontmatter：description 用模型的，name 一律以规范化的目录名为准
+    res = reg.invoke("createSkill", json.dumps({
+        "name": "with-fm",
+        "skillcontext": "---\nname: 乱写的名字\ndescription: 带冒号：的说明\n---\n\n正文一段。",
+    }), maker)
+    assert res.ok, res.content
+    fm = parse_frontmatter(read_skill("with-fm", "SKILL.md"))
+    assert fm["name"] == "with-fm", fm
+    assert fm["description"] == "带冒号：的说明", fm
+    print("createSkill 自带 frontmatter -> 保留 description，name 对齐目录名")
+
+    # 重名：拒绝覆盖，原文件一个字都不能动
+    before = read_skill("demo-skill", "SKILL.md")
+    res = reg.invoke("createSkill", json.dumps({
+        "name": "demo-skill", "skillcontext": "想把这行写进去覆盖掉"}), maker)
+    print("createSkill 重名 ->", res.content.splitlines()[0])
+    assert not res.ok and "已经存在" in res.content, res.content
+    assert read_skill("demo-skill", "SKILL.md") == before, "重名时原文件被改了！"
+
+    # 中文名：压成空串，要求给英文名（不替用户音译）
+    res = reg.invoke("createSkill", json.dumps({
+        "name": "天气预报", "skillcontext": "正文"}), maker)
+    assert not res.ok and "英文" in res.content, res.content
+    print("createSkill 中文名 -> 拒绝并提示改用英文名")
+
+    # 缺参 / 空内容
+    res = reg.invoke("createSkill", "{}", maker)
+    assert not res.ok and "name 参数" in res.content, res.content
+    res = reg.invoke("createSkill", '{"name":"empty-body","skillcontext":"   "}', maker)
+    assert not res.ok and "skillcontext" in res.content, res.content
+    print("createSkill 缺 name / 空 skillcontext -> 都如实拒绝")
+
+    # 没有刷新回调：必须说清"重启后生效"，不能让人以为马上能用
+    solo = ToolContext(max_read_chars=20000, confirm=lambda t, m: False, skills=catalog)
+    res = reg.invoke("createSkill", json.dumps({
+        "name": "no-refresh", "skillcontext": "只建文件，不管清单。"}), solo)
+    assert res.ok and "重启后" in res.content, res.content
+    print("createSkill 无刷新回调 -> 明确告知重启后生效")
+
     shutil.rmtree(skill_root, ignore_errors=True)
+
+    # ---- MCP Client：纯离线部分（配置解析 / 名字消毒 / 冲突规则 / 结果排版）
+    from xiaoA.core.mcp import (
+        McpError,
+        format_call_result,
+        parse_mcp_config,
+        plan_tool_names,
+        sanitize_name,
+    )
+
+    cfg_path = os.path.join(tempfile.mkdtemp(prefix="xiaoA_mcp_"), ".mcp.json")
+    with open(cfg_path, "w", encoding="utf-8") as f:
+        json.dump({"mcpServers": {
+            "PetHospital": {"url": "http://127.0.0.1:8090/mcp"},
+            "中文服务": {"url": "http://127.0.0.1:9000/mcp", "headers": {"X-Token": "t"}},
+            "坏的": {"url": "ftp://nope"},
+            "没url的": {},
+        }}, f, ensure_ascii=False)
+    servers, problems = parse_mcp_config(cfg_path)
+    assert [s.name for s in servers] == ["PetHospital", "中文服务"], servers
+    assert servers[1].headers == {"X-Token": "t"}
+    assert any("url 必须以" in p for p in problems), problems
+    assert any("没有 url 字段" in p for p in problems), problems
+    print("MCP 配置解析 -> 正常 2 台、坏项全部进 problems")
+
+    # 名字消毒：中文/点号/数字开头都要落到 Function Calling 能接受的形态。
+    # 纯中文名变出的全是下划线，等于没名字 → 回退 fallback（重名会被冲突规则兜住）。
+    assert sanitize_name("中文服务", "server") == "server"
+    assert sanitize_name("另一台", "server") == "server"
+    assert sanitize_name("pet.hospital 2", "server") == "pet_hospital_2"
+    assert sanitize_name("9lives", "server") == "_9lives"
+    assert sanitize_name("", "server") == "server"
+    assert sanitize_name("///", "tool") == "tool"
+    print("MCP 名字消毒 -> 中文/点号/数字开头/空名全部合规")
+
+    # 冲突规则：唯一且不撞本地 → 裸名；撞了 → 服务器名前缀
+    remote = [
+        ("PetHospital", [("list_pets", "列出宠物", {"type": "object"}),   # 唯一 → 裸名
+                         ("RunCli", "和本地重名", {"type": "object"})]),
+        ("另一台", [("getDate", "和本地重名", {"type": "object"})]),
+    ]
+    infos, name_problems = plan_tool_names(remote, ["RunCli", "getDate"])
+    by_exposed = {i.exposed: i for i in infos}
+    assert by_exposed["list_pets"].server == "PetHospital"       # 唯一且不撞 → 裸名
+    assert by_exposed["PetHospital__RunCli"].original == "RunCli"
+    assert by_exposed["server__getDate"].server == "另一台"      # 中文名消毒后加前缀
+    assert by_exposed["server__getDate"].original == "getDate"
+    assert not name_problems, name_problems
+    for info in infos:
+        assert re.fullmatch(r"[0-9A-Za-z_-]{1,64}", info.exposed), info.exposed
+    print("MCP 冲突规则 -> 唯一裸名 / 撞名加前缀 / 暴露名全部合规")
+
+    # 结果排版：文本 + 结构化 + 业务错误 + 空结果
+    class FakeText:
+        def __init__(self, t): self.text = t; self.mimeType = ""
+    class FakeResult:
+        def __init__(self, content, is_error=False, structured=None):
+            self.content, self.isError, self.structuredContent = content, is_error, structured
+    text, ok = format_call_result(FakeResult([FakeText("有 3 只宠物")]), 8000)
+    assert ok and "3 只宠物" in text
+    text, ok = format_call_result(FakeResult([], is_error=True), 8000)
+    assert not ok and text
+    text, ok = format_call_result(
+        FakeResult([FakeText("部分")], structured={"count": 3}), 8000)
+    assert ok and '"count": 3' in text and "结构化数据" in text
+    text, ok = format_call_result(FakeResult([]), 8000)
+    assert ok and "没有返回内容" in text
+    long = "x" * 20000
+    text, ok = format_call_result(FakeResult([FakeText(long)]), 1000)
+    assert len(text) < 2000 and "省略" in text
+    print("MCP 结果排版 -> 文本/错误/结构化/空返回/截断 全部正确")
+
+    # 连不上：给一个必然拒绝的端口，确认只进 problems、不炸程序
+    from xiaoA.core.mcp import load_mcp_manager
+    dead_path = os.path.join(tempfile.mkdtemp(prefix="xiaoA_mcp_dead_"), ".mcp.json")
+    with open(dead_path, "w", encoding="utf-8") as f:
+        json.dump({"mcpServers": {" dead": {"url": "http://127.0.0.1:9/mcp"}}}, f)
+    dead = load_mcp_manager(dead_path, connect_timeout=3.0, call_timeout=5.0)
+    assert dead is not None and not dead.tools
+    assert dead.connections == [] and len(dead.problems) == 1, dead.problems
+    assert "MCP" in dead.problems[0] or "mcp" in dead.problems[0].lower()
+    dead.shutdown()
+    print("MCP 连接失败 -> 只进 problems，其余工具不受影响：", dead.problems[0][:60], "…")
+
+    # 没配 .mcp.json：load 返回 None（零开销路径）
+    none_mgr = load_mcp_manager(os.path.join(tempfile.mkdtemp(prefix="xiaoA_mcp_no_"),
+                                              ".mcp.json"))
+    assert none_mgr is None
+    print("MCP 未配置 -> load_mcp_manager 返回 None，一行多余的活都不干")
 
     # ---- 分层检查：core 绝不能出现界面依赖
     for mod_name, mod in list(sys.modules.items()):
