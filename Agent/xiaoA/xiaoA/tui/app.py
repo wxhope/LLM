@@ -36,6 +36,7 @@ from textual.widgets import Input, Static
 
 from ..core.config import AppConfig, ConfigError, load_config
 from ..core.events import (
+    ContextUsageChanged,
     ErrorOccurred,
     Notice,
     ReplyCompleted,
@@ -69,8 +70,36 @@ CURSOR = "▍"
 PREFIX = "xiaoA ▸ "
 PREFIX_WIDTH = len(PREFIX)
 
+
+def fmt_k(tokens: int) -> str:
+    """按 1000 进位显示（模型窗口都以 128k = 128000 这种十进制标称）。
+
+    128000 → "128k"，42000 → "42k"，4200 → "4.2k"，900 → "900"。
+    用 1024 会把 128k 显示成 125.0k，看着像另一个模型，白白让人怀疑配置。
+    """
+    if tokens < 1000:
+        return str(tokens)
+    value = tokens / 1000.0
+    if value >= 100:
+        return "%.0fk" % value
+    return "%.1fk" % value
+
+
+def format_context(tokens: int, window: int, percent: float,
+                   window_is_default: bool) -> str:
+    """状态栏里的那一段：上下文 42.3k / 128k（33%）默认
+
+    「默认」两个字是要求里点名的：窗口大小不是从模型拿的，就得说明白，
+    否则用户会以为 128k 是这家模型的真实上限。
+    """
+    text = "上下文 %s / %s（%.0f%%）" % (fmt_k(tokens), fmt_k(window), percent)
+    if window_is_default:
+        text += " 默认"
+    return text
+
 HELP_TEXT = (
-    "命令：/help 帮助  /clear 清空历史  /quit 退出  /model 查看模型  /tools 列出工具"
+    "命令：/help 帮助  /clear 清空历史  /compact 压缩上下文  /quit 退出  "
+    "/model 查看模型  /tools 列出工具"
 )
 
 
@@ -127,6 +156,12 @@ class XiaoAApp(App):
         self.busy = False
         self._started_at = time.time()
         self._pending_confirm = False          # 有一个确认框正等着回答
+
+        # ---- 上下文占用（状态栏显示 + 到阈值后拦输入）
+        self._ctx_text = ""                    # 例如 "上下文 42.3k / 128k（33%）默认"
+        self._ctx_blocked = False              # True = 等 /compact，暂停接收提问
+        self._status_text = "启动中"
+        self.status_line = ""                  # 状态栏最后渲染的那一行（便于测试）
 
         # ---- 流式状态（逐字输出）
         # 收到 = _live_target（模型已经推来的全文）
@@ -190,6 +225,8 @@ class XiaoAApp(App):
             self.write_notice(self.session.mcp.summary)
             for problem in self.session.mcp.problems:
                 self.write_notice("MCP提醒：%s" % problem)
+        # 上下文占用：先把当前值算出来贴到状态栏（空历史就是 0）
+        self._sync_context_usage()
         self.set_status("空闲")
         self.query_one("#composer", Input).focus()
 
@@ -235,6 +272,14 @@ class XiaoAApp(App):
                 self.set_status("第 %d 轮请求…" % event.round_index)
         elif isinstance(event, Notice):
             self.write_notice(event.text)
+        elif isinstance(event, ContextUsageChanged):
+            # 占用变了：刷状态栏。到阈值后同时把输入框提示换掉，
+            # 让"为什么发不出去"一眼可见。
+            self._ctx_text = format_context(event.tokens, event.window,
+                                            event.percent, event.window_is_default)
+            self._ctx_blocked = event.blocked
+            self.set_status(self._status_text)
+            self._update_placeholder()
         elif isinstance(event, ErrorOccurred):
             self.finish_stream()
             self.write_error(event.message)
@@ -376,9 +421,42 @@ class XiaoAApp(App):
         self.write("✗ " + text)
 
     def set_status(self, text: str) -> None:
+        self._status_text = text
         model = self.config_obj.model if self.config_obj else "-"
-        self.query_one("#status", StatusBar).update(
-            " %s   │   模型 %s   │   %s" % ("●" if self.busy else "○", model, text))
+        parts = ["●" if self.busy else "○", "模型 %s" % model]
+        if self._ctx_text:
+            parts.append(self._ctx_text)
+        parts.append(text)
+        line = " " + "   │   ".join(parts)
+        self.status_line = line            # 留一份纯文本：调试和冒烟测试读它
+        self.query_one("#status", StatusBar).update(line)
+
+    # ---------------------------------------------------------------- 上下文占用
+
+    def _sync_context_usage(self) -> None:
+        """从会话层拉一次占用，贴到状态栏。
+
+        为什么要在 UI 侧也主动拉：启动时还没有任何事件，
+        状态栏不能空着——空着用户就不知道窗口多大、现在用了多少。
+        """
+        if self.session is None:
+            return
+        usage = self.session.context_usage()
+        self._ctx_text = format_context(usage.tokens, usage.window,
+                                        usage.percent, usage.window_is_default)
+        self._ctx_blocked = self.session.blocked
+        self._update_placeholder()
+
+    def _update_placeholder(self) -> None:
+        try:
+            box = self.query_one("#composer", Input)
+        except Exception:      # noqa: BLE001 - 界面还没挂载完时别炸
+            return
+        if self._pending_confirm:
+            return
+        box.placeholder = ("上下文已达阈值，输入 /compact 压缩后继续…"
+                           if self._ctx_blocked
+                           else "说点什么，Enter 发送，Shift+Enter 换行…")
 
     def refresh_header(self, extra: str = "") -> None:
         cwd = os.getcwd()
@@ -436,6 +514,12 @@ class XiaoAApp(App):
             return
         if self.session is None:
             return
+        # 到阈值后只认 /compact：普通提问在这里就拦下，不发请求（省钱也省配额）
+        if self.session.blocked:
+            self.write_notice("上下文已到阈值，请先输入 /compact 压缩上下文。")
+            self._sync_context_usage()
+            self.set_status(self._status_text)
+            return
 
         self.write_user(text)
         self.busy = True
@@ -449,8 +533,47 @@ class XiaoAApp(App):
         try:
             self.session.ask(text)
         except Exception as e:  # noqa: BLE001 —— 后台线程抛异常会让界面无声卡住
-            self.write_error("后台任务异常：%s" % e)
-            self.busy = False
+            self.call_from_thread(self.write_error, "后台任务异常：%s" % e)
+            self.call_from_thread(self._turn_done)
+
+    def _turn_done(self) -> None:
+        self.busy = False
+        self._sync_context_usage()
+        self.set_status(self._status_text)
+
+    # ---------------------------------------------------------------- 压缩
+
+    def start_compact(self) -> None:
+        """由用户敲 /compact 触发。压缩在后台线程跑，界面照常响应。"""
+        if self.session is None:
+            return
+        if self.busy:
+            self.write_notice("上一句还在处理中，等它结束再压缩。")
+            return
+        if not self.session.messages:
+            self.write_notice("当前没有对话历史，不需要压缩。")
+            return
+        self.finish_stream()
+        self.busy = True
+        self.set_status("压缩中…（期间不接受新提问）")
+        self.run_compact()
+
+    @work(thread=True, exclusive=True)
+    def run_compact(self) -> None:
+        """后台线程执行压缩。所有界面改动都通过 call_from_thread 回主线程。"""
+        assert self.session is not None
+        ok = False
+        try:
+            ok = bool(self.session.compact())
+        except Exception as e:  # noqa: BLE001 —— 压缩失败不能让界面卡死
+            self.call_from_thread(self.write_error, "压缩异常：%s" % e)
+        self.call_from_thread(self._compact_done, ok)
+
+    def _compact_done(self, ok: bool) -> None:
+        self.busy = False
+        self.end_stream()          # 摘要的流式输出收尾
+        self._sync_context_usage()
+        self.set_status("压缩完成" if ok else "压缩失败，可重试 /compact")
 
     # ---------------------------------------------------------------- 命令
 
@@ -465,6 +588,10 @@ class XiaoAApp(App):
                 self.finish_stream()
                 self.transcript.remove_children()
                 self.write_notice("历史已清空。")
+                self._sync_context_usage()
+                self.set_status("空闲")
+        elif cmd == "/compact":
+            self.start_compact()
         elif cmd == "/help":
             self.action_show_help()
         elif cmd == "/tools":

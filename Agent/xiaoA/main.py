@@ -52,6 +52,11 @@ def check_core(config_path=None) -> int:
         print("网页抓取：找不到 curl.exe（FetchWeb 不可用）")
     print("本地命令：超时 %g 秒 ｜ stdout/stderr 各上限 %d 字符 ｜ 不设命令白名单（教学阶段）"
           % (cfg.cli_timeout, cfg.cli_max_chars))
+    print("上下文窗口：%d tokens%s ｜ 告警线 %.0f%% ｜ 归档目录 %s"
+          % (cfg.context_window,
+             "（默认值）" if cfg.context_window_is_default else "",
+             cfg.context_warn_ratio * 100,
+             os.path.join(os.getcwd(), ".agents", "context")))
     print("工具 %d 个：%s" % (len(reg), "、".join(reg.names())))
     print(catalog.summary())
     for problem in catalog.problems:

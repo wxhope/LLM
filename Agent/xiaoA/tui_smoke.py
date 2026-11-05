@@ -27,7 +27,7 @@ from xiaoA.core.llm.types import StreamDelta
 from xiaoA.core.session import Session
 from xiaoA.core.tools import ToolRegistry
 from xiaoA.core.tools.builtin import datetime_ops, fs_ops, math_ops
-from xiaoA.tui.app import Message, XiaoAApp
+from xiaoA.tui.app import HELP_TEXT, Message, XiaoAApp
 
 FAILS = []
 
@@ -119,10 +119,15 @@ async def case_layout() -> None:
         await pilot.press("ctrl+t")
         await settle(pilot, 5)
         check("Ctrl+T 列出工具", "getDate" in screen_text(app))
+        # 上下文占用必须一直在状态栏上：当前 k / 窗口 k（%）+「默认」提示
+        status = app.status_line
+        check("状态栏显示上下文占用", "上下文" in status and "128k" in status, status)
+        check("窗口是默认值时标注「默认」", "默认" in status, status)
         app.query_one("#composer").value = "/model"
         await pilot.press("enter")
         await settle(pilot, 5)
         check("/model 显示假模型名", "fake-model" in screen_text(app))
+        check("帮助里提到 /compact", "/compact" in HELP_TEXT)
 
 
 async def case_tool_round() -> None:
@@ -249,17 +254,59 @@ async def case_typing() -> None:
         check("定格后没有残留光标", "▍" not in final)
 
 
+async def case_compact() -> None:
+    print("\n【场景六】/compact：阈值拦截 + 压缩 + 解禁")
+    ctxdir = os.path.join(tempfile.mkdtemp(prefix="xiaoA_tui_ctx_"), "ctx")
+    cfg = AppConfig(api_key="sk-test", base_url="https://example.invalid",
+                    model="fake-model", max_read_chars=1000, max_tool_rounds=3,
+                    context_window=1000)      # 故意给小窗口，方便触发 70%
+    client = FakeClient([text_deltas("## 工作摘要\n- 已完成冒烟测试")])
+    app = XiaoAApp(config=cfg)
+    app.session = Session(cfg, client=client, registry=ToolRegistry(),
+                          sink=app.sink, confirm=app.confirm_port,
+                          context_dir=ctxdir)
+    async with app.run_test(size=(110, 32)) as pilot:
+        await settle(pilot, 5)
+        # 塞一大段历史，把占用顶过 70%
+        app.session.messages = [{"role": "user", "content": "重要内容" * 200}]
+        app.session._refresh_context_usage()
+        await settle(pilot, 3)
+        check("到阈值后状态栏显示占用", "上下文" in app.status_line, app.status_line)
+        check("输入框提示已切换", "compact" in app.query_one("#composer").placeholder)
+
+        app.query_one("#composer").value = "还想继续问"
+        await pilot.press("enter")
+        await settle(pilot, 5)
+        check("阻断时提问被拦下", "请先输入 /compact" in screen_text(app))
+        check("阻断时没有发请求", client.calls == 0, "calls=%d" % client.calls)
+
+        app.query_one("#composer").value = "/compact"
+        await pilot.press("enter")
+        await settle(pilot, 80)
+        check("压缩完成提示出现", "压缩完成" in screen_text(app))
+        check("压缩只发 1 次请求且不带 tools",
+              client.calls == 1 and client.seen_tools is None,
+              "calls=%d tools=%s" % (client.calls, client.seen_tools))
+        check("历史已替换为摘要",
+              len(app.session.messages) == 1
+              and "压缩摘要" in app.session.messages[0]["content"])
+        check("归档文件已生成",
+              os.path.isdir(ctxdir) and bool(os.listdir(ctxdir)), ctxdir)
+        check("压缩后解除阻断", not app.session.blocked)
+
+
 async def main() -> int:
     await case_layout()
     await case_tool_round()
     await case_confirm()
     await case_clear()
     await case_typing()
+    await case_compact()
     print()
     if FAILS:
         print("有问题（%d 项）：%s" % (len(FAILS), "；".join(FAILS)))
         return 1
-    print("OK：TUI 五个场景全部通过")
+    print("OK：TUI 六个场景全部通过")
     return 0
 
 

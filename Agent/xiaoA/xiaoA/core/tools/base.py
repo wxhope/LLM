@@ -57,6 +57,10 @@ class ToolContext:
     mcp_call_timeout: float = 60.0
     mcp_max_chars: int = 8000
 
+    # ---- 上下文归档目录（recallContext 在这里检索历史原文）。
+    # 空串 = 没挂，工具会如实告诉模型"没有归档目录"。
+    context_dir: str = ""
+
     # ---- 技能注册表：loadSkill 靠它把 SKILL.md 全文取出来。
     # None / 空表 = 没有技能，工具会如实说明，而不是猜。
     skills: Optional["SkillCatalog"] = None

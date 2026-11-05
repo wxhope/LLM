@@ -353,6 +353,11 @@ def _humanize_error(e: Exception, url: str) -> str:
         if url in text:
             return text
         return "%s（服务器 %s）。确认服务在跑、地址端口没写错。" % (text, url)
+    # SDK 自己的 McpError（mcp.shared.exceptions）不在我们的类体系里，按名字认
+    if type(e).__name__.lower() == "mcperror":
+        return ("MCP 握手失败（服务器 %s）：%s。多半是服务没启动、路径不对"
+                "（Streamable HTTP 通常是 http://主机:端口/mcp），"
+                "或被代理拦截。" % (url, text))
     if "connectionrefused" in lowered or "winerror 10061" in lowered:
         return ("连接被拒绝（%s）。服务器大概率没启动——先把 MCP 服务跑起来，"
                 "再重启 xiaoA。" % url)

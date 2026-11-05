@@ -103,10 +103,26 @@ class TokenUsage(Event):
     total_tokens: Optional[int] = None
 
 
+@dataclass(frozen=True)
+class ContextUsageChanged(Event):
+    """上下文占用变了（每轮回答后、压缩后发一次）。
+
+    UI 拿它刷状态栏：当前多少 k / 窗口多少 k / 占了几成。
+    source="api" 表示数字来自服务端 usage，否则是本地估算。
+    """
+    tokens: int
+    window: int
+    percent: float
+    source: str = "estimate"
+    window_is_default: bool = False
+    blocked: bool = False       # True = 已到阈值，暂停接收新提问，等 /compact
+
+
 # 便捷联合类型，方便 UI 写 isinstance 分支
 ALL_EVENTS: List[Any] = [
     TextDelta, RoundStarted, ToolCallStarted, ToolCallFinished,
     ReplyCompleted, Notice, ErrorOccurred, SessionClosed, TokenUsage,
+    ContextUsageChanged,
 ]
 
 __all__ = [
@@ -120,5 +136,6 @@ __all__ = [
     "ErrorOccurred",
     "SessionClosed",
     "TokenUsage",
+    "ContextUsageChanged",
     "ALL_EVENTS",
 ]

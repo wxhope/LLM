@@ -16,6 +16,7 @@ import tempfile
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
+from xiaoA.core.llm import StreamDelta
 from xiaoA.core.llm.stream import parse_line
 from xiaoA.core.tools import ToolContext, ToolRegistry, build_default_registry
 from xiaoA.core.tools.builtin.math_ops import is_leap_year
@@ -41,8 +42,8 @@ Q = lambda p: p.replace("\\", "\\\\")   # 拼 JSON 时转义反斜杠
 
 def main() -> int:
     reg = build_default_registry()
-    assert len(reg) == 17, "内置工具应有 17 个，实际 %d" % len(reg)
-    assert len(reg.schemas()) == 17
+    assert len(reg) == 18, "内置工具应有 18 个，实际 %d" % len(reg)
+    assert len(reg.schemas()) == 18
     print("工具清单（%d）：%s" % (len(reg), "、".join(reg.names())))
 
     denied = ToolContext(max_read_chars=200, confirm=lambda t, m: False)
@@ -630,6 +631,155 @@ def main() -> int:
                                               ".mcp.json"))
     assert none_mgr is None
     print("MCP 未配置 -> load_mcp_manager 返回 None，一行多余的活都不干")
+
+    # ---- 上下文压缩与历史检索：全离线（不联网、不需要真模型）
+    from xiaoA.core.compact import (
+        ArchiveError,
+        archive_messages,
+        build_compact_messages,
+        build_summary_message,
+        estimate_tokens,
+        list_archives,
+        search_archives,
+    )
+
+    assert 1 <= estimate_tokens("你好") <= 4, estimate_tokens("你好")
+    assert estimate_tokens("hello world") <= 5
+    assert estimate_tokens("") == 0
+    long_cn = "上下文压缩" * 100
+    assert estimate_tokens(long_cn) == len(long_cn), estimate_tokens(long_cn)
+    print("token 估算 -> 中文≈1字1token、英文≈4字符1token、空串为 0")
+
+    ctx_root = tempfile.mkdtemp(prefix="xiaoA_ctx_")
+    history = [
+        {"role": "user", "content": "宠物医院的 MCP 跑在 8090 端口"},
+        {"role": "assistant", "content": "", "tool_calls": [{
+            "id": "c1", "type": "function",
+            "function": {"name": "RunCli",
+                         "arguments": "{\"command\":\"curl\",\"args\":[\"http://127.0.0.1:8090/mcp\"]}"}}]},
+        {"role": "tool", "tool_call_id": "c1",
+         "content": "BACKEND_API_ERROR: backend returned HTTP 502"},
+    ]
+    record = archive_messages(history, ctx_root)
+    assert re.fullmatch(r"\d{8}-\d{6}(-\d+)?", record.archive_id), record.archive_id
+    assert os.path.isfile(record.path) and record.message_count == 3
+    with open(record.path, encoding="utf-8") as f:
+        lines = f.readlines()
+    assert len(lines) == 4, "meta + 3 条消息"
+    rows = [json.loads(x) for x in lines]
+    assert rows[0]["type"] == "meta" and rows[0]["archive_id"] == record.archive_id
+    assert [r["index"] for r in rows[1:]] == [0, 1, 2], "顺序必须原样保留"
+    assert rows[2]["tool_calls"][0]["function"]["name"] == "RunCli"
+    assert "8090" in json.dumps(rows[1], ensure_ascii=False)
+    print("归档 -> %s 写出 %d 条，meta/顺序/工具调用参数都在"
+          % (record.archive_id, record.message_count))
+
+    second = archive_messages(history, ctx_root)
+    assert second.archive_id != record.archive_id, "同一秒两次压缩不能互相覆盖"
+    print("归档重名 -> 同秒再写自动加序号（%s）" % second.archive_id)
+
+    # 写失败必须抛错：宁可没压缩，也不能丢了原文
+    bogus = os.path.join(ctx_root, "not_a_dir")
+    open(bogus, "w").close()
+    try:
+        archive_messages(history, bogus)
+        raise AssertionError("归档目录不可写时应当抛 ArchiveError")
+    except ArchiveError as e:
+        assert "归档" in str(e) or "写" in str(e), str(e)
+    print("归档失败 -> 抛 ArchiveError（中止压缩而不是静默继续）")
+
+    # 检索：关键词命中带编号/序号/角色；查不到要如实说；id 过滤生效
+    hits, err = search_archives(ctx_root, "BACKEND_API_ERROR")
+    assert not err and hits, err
+    assert hits[0].archive_id == second.archive_id and hits[0].index == 2, hits[0]
+    assert "502" in hits[0].snippet
+    hits2, err2 = search_archives(ctx_root, "8090")
+    assert not err2 and any(h.index == 0 for h in hits2), hits2
+    none_hits, none_err = search_archives(ctx_root, "根本没有这个词xyz")
+    assert not none_hits and "没有找到" in none_err
+    missing, missing_err = search_archives(ctx_root, "8090", archive_id="19990101-000000")
+    assert not missing and "没有编号" in missing_err
+    only_first, _ = search_archives(ctx_root, "8090", archive_id=record.archive_id)
+    assert only_first and all(h.archive_id == record.archive_id for h in only_first)
+    print("检索 -> 命中带编号/序号/角色/片段；查不到和坏编号都如实说明")
+
+    # 压缩摘要必须带归档说明（模型靠它知道还能 recallContext）
+    replaced = build_summary_message("## 目标\n- 接入 MCP", record.archive_id, record.created_at)
+    assert replaced["role"] == "user"
+    assert "压缩摘要" in replaced["content"] and record.archive_id in replaced["content"]
+    assert "recallContext" in replaced["content"]
+    payload = build_compact_messages(history)
+    assert payload[0]["role"] == "system" and "上下文管理助手" in payload[0]["content"]
+    assert "宠物医院" in payload[1]["content"]
+    print("压缩 Prompt / 替代消息 -> 摘要带归档说明 + 指向 recallContext")
+
+    # recallContext 工具：注册、参数校验、真实检索
+    recall_ctx = ToolContext(max_read_chars=2000, confirm=lambda t, m: False,
+                             context_dir=ctx_root)
+    res = reg.invoke("recallContext", '{"text":"BACKEND_API_ERROR"}', recall_ctx)
+    assert res.ok and "归档" in res.content and "502" in res.content, res.content
+    bad = reg.invoke("recallContext", "{}", recall_ctx)
+    assert not bad.ok and "text" in bad.content
+    traversal = reg.invoke("recallContext", '{"text":"x","id":"../../etc/passwd"}', recall_ctx)
+    assert not traversal.ok and "编号" in traversal.content, traversal.content
+    no_dir = reg.invoke("recallContext", '{"text":"x"}',
+                        ToolContext(max_read_chars=200, context_dir=""))
+    assert not no_dir.ok and "目录" in no_dir.content
+    print("recallContext 工具 -> 命中正常、缺 text / 坏编号 / 无目录都拒绝")
+
+    # ---- 会话层：70% 阻断 + 压缩成功替换历史（假客户端，不联网）
+    from xiaoA.core.config import AppConfig
+    from xiaoA.core.session import Session
+
+    class FakeCompactClient:
+        """只回一段摘要的假客户端；记录被调用时的 tools 参数。"""
+
+        def __init__(self):
+            self.tools_arg = "unset"
+            self.calls = 0
+
+        def chat_stream(self, messages, model, tools=None):
+            self.calls += 1
+            self.tools_arg = tools
+            yield StreamDelta(content="## 已完成的压缩摘要\n- 接入 8090 的 MCP")
+            yield StreamDelta(done=True)
+
+    small_cfg = AppConfig(api_key="sk-test", base_url="https://example.invalid",
+                          model="fake", context_window=1000)
+    fake = FakeCompactClient()
+    sess = Session(small_cfg, client=fake, registry=ToolRegistry(),
+                   context_dir=os.path.join(tempfile.mkdtemp(prefix="xiaoA_sess_"), "ctx"))
+    sess.messages = [{"role": "user", "content": "上下文" * 800}]   # 明显超过 70%
+    sess._refresh_context_usage()
+    assert sess.blocked, "占用超过 70% 应当进入阻断状态"
+    assert sess.ask("还能提问吗") is None, "阻断后不应再发请求"
+    assert fake.calls == 0, "阻断发生在请求之前，不能先花一次调用"
+    print("上下文监控 -> 超 70% 自动阻断，提问在发请求前就被拦下")
+
+    assert sess.compact() is True
+    assert fake.calls == 1 and fake.tools_arg is None, "压缩请求不能带 tools"
+    assert len(sess.messages) == 1 and sess.messages[0]["role"] == "user"
+    assert "压缩摘要" in sess.messages[0]["content"]
+    assert "recallContext" in sess.messages[0]["content"]
+    assert not sess.blocked, "压缩成功后必须解除阻断"
+    assert list_archives(sess.context_dir), "压缩前必须留下归档"
+    print("压缩流程 -> 归档 → 摘要 → 替换历史 → 解除阻断；请求不带 tools")
+
+    # 压缩失败：历史原样保留、仍可重试
+    class BrokenClient:
+        def chat_stream(self, messages, model, tools=None):
+            from xiaoA.core.llm import LLMError
+            raise LLMError("接口挂了")
+            yield  # pragma: no cover
+
+    sess2 = Session(small_cfg, client=BrokenClient(), registry=ToolRegistry(),
+                    context_dir=os.path.join(tempfile.mkdtemp(prefix="xiaoA_sess2_"), "ctx"))
+    sess2.messages = [{"role": "user", "content": "重要内容不要丢" * 100}]
+    before = list(sess2.messages)
+    assert sess2.compact() is False
+    assert sess2.messages == before, "压缩失败后历史必须一字不动"
+    assert not sess2.compacting
+    print("压缩失败 -> 历史原样保留，可以重试 /compact")
 
     # ---- 分层检查：core 绝不能出现界面依赖
     for mod_name, mod in list(sys.modules.items()):

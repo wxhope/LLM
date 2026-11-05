@@ -15,10 +15,20 @@ from __future__ import annotations
 
 import os
 from dataclasses import dataclass, field
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
+from .compact import (
+    ArchiveError,
+    ContextUsage,
+    archive_messages,
+    build_compact_messages,
+    build_summary_message,
+    compute_usage,
+    context_dir as context_dir_of,
+)
 from .config import AppConfig
 from .events import (
+    ContextUsageChanged,
     ErrorOccurred,
     Notice,
     ReplyCompleted,
@@ -31,7 +41,7 @@ from .events import (
 from .llm import AssistantMessage, LLMClient, LLMError, StreamDelta, ToolCall
 from .mcp import McpManager, load_mcp_manager
 from .ports import ConfirmPort, EventSink
-from .skills import SkillCatalog, discover_skills
+from .skills import STARTUP_CWD, SkillCatalog, discover_skills
 from .tools import DangerLevel, ToolContext, ToolRegistry, build_default_registry
 
 SYSTEM_PROMPT = (
@@ -49,6 +59,8 @@ SYSTEM_PROMPT = (
     "读文件、列目录、写文件优先用专用文件工具，不要用 dir/type/copy 这类 cmd 内建命令。"
     "RunCli 会返回退出码、stdout 和 stderr：退出码不为 0 就是没跑成，"
     "先按 stderr 里的原因调整，不要拿同样的参数重复调用。"
+    "历史被 /compact 压缩后，你看到的是一份摘要；摘要里缺细节（具体路径、命令、"
+    "报错、早期约定）时，用 recallContext 按关键词检索原始归档，不要凭印象编造。"
 )
 
 # 有技能时拼在基础提示词后面。清单只给 name 和 description（注册阶段就这些），
@@ -96,6 +108,7 @@ class Session:
         allow_tools: bool = True,
         skills: Optional[SkillCatalog] = None,
         mcp: Optional[McpManager] = None,
+        context_dir: Optional[str] = None,
     ) -> None:
         self.config = config
         # 依赖全部从外部注入，默认值只是"常用的那一套"
@@ -121,6 +134,14 @@ class Session:
         self.stats = TurnStats()
         self._closed = False
 
+        # ---- 上下文管理（压缩 / 用量监控 / 归档检索）
+        # 归档目录：<启动目录>/.agents/context，和技能目录同一个项目根
+        self.context_dir = context_dir or context_dir_of(STARTUP_CWD)
+        self._compacting = False           # 正在压缩：期间不接提问、不跑工具
+        self._needs_compact = False        # 已到阈值：暂停接收新提问，等 /compact
+        self._api_prompt_tokens: Optional[int] = None   # 上一次请求服务端报的用量
+        self._last_usage: Optional[ContextUsage] = None
+
     # ---------------------------------------------------------------- 生命周期
 
     def attach(self, sink: EventSink) -> None:
@@ -130,7 +151,11 @@ class Session:
     def clear(self) -> None:
         """清空历史（对应 /clear 命令）。"""
         self.messages.clear()
+        # 清空等于重新开始：用量归零，压缩禁令一并解除
+        self._api_prompt_tokens = None
+        self._needs_compact = False
         self._emit(Notice("对话历史已清空。"))
+        self._refresh_context_usage()
 
     @property
     def history_size(self) -> int:
@@ -159,6 +184,23 @@ class Session:
         if self._closed:
             self._notice("会话已关闭。", "warning")
             return None
+        # 压缩期间不允许处理别的任务：模型只能出现在压缩请求里，
+        # 更不能反手去调工具（压缩请求本身不带 tools 字段）。
+        if self._compacting:
+            self._notice("正在压缩上下文，压缩完成前不接受新提问。", "warning")
+            return None
+        if self._needs_compact:
+            usage = self.context_usage()
+            self._notice(
+                "上下文已占用 %.1f%%（%d / %d tokens），已暂停接收新提问。"
+                "请输入 /compact 压缩上下文后再继续。"
+                % (usage.percent, usage.tokens, usage.window),
+                "warning")
+            self._emit(ContextUsageChanged(
+                tokens=usage.tokens, window=usage.window, percent=usage.percent,
+                source=usage.source, window_is_default=usage.window_is_default,
+                blocked=True))
+            return None
 
         snapshot = len(self.messages)          # 失败时回滚到这里
         self.messages.append({"role": "user", "content": text})
@@ -178,6 +220,8 @@ class Session:
             return None
 
         if final is not None:
+            # 每轮回答结束都算一次占用：这是"到 70% 就提醒"的触发点
+            self._refresh_context_usage()
             self._emit(ReplyCompleted(
                 text=final.content,
                 rounds=self.stats.rounds,
@@ -205,6 +249,9 @@ class Session:
                 return message
 
             self._run_tools(message.tool_calls)
+            # 每轮工具调用后刷新一次占用：工具结果往往很长，
+            # 等整轮结束才看，可能已经贴着上限了
+            self._refresh_context_usage()
 
         self._notice("工具连着调了 %d 轮还没结束，先停在这里。" % max_rounds, "warning")
         return AssistantMessage(content="")
@@ -237,6 +284,9 @@ class Session:
                     total_tokens=usage.get("total_tokens"),
                 ))
                 self.stats.prompt_tokens = usage.get("prompt_tokens")
+                # 服务端计数是精确值，留着给上下文占用当基准
+                if usage.get("prompt_tokens"):
+                    self._api_prompt_tokens = int(usage["prompt_tokens"])
 
         ordered = [calls[i] for i in sorted(calls)]
         return AssistantMessage(content="".join(text_parts), tool_calls=ordered)
@@ -278,6 +328,8 @@ class Session:
             # createSkill 建完目录后靠它重扫，新技能当场可用
             refresh_skills=self.refresh_skills,
             config_path=self.config.config_path,
+            # recallContext 去这个目录下翻归档
+            context_dir=self.context_dir,
         )
         for i, call in enumerate(calls):
             if not call.id:
@@ -319,6 +371,122 @@ class Session:
             # 没有确认口就一律不执行危险操作 —— 宁可不动手
             return False
         return bool(self.confirm.ask(title, message))
+
+    # ---------------------------------------------------------------- 上下文压缩
+
+    @property
+    def compacting(self) -> bool:
+        """正在压缩。UI 用它在状态栏显示"压缩中"，并挡住输入框。"""
+        return self._compacting
+
+    @property
+    def blocked(self) -> bool:
+        """上下文已到阈值，暂停接收新提问（等 /compact）。"""
+        return self._needs_compact
+
+    def context_usage(self) -> ContextUsage:
+        """算当前占用。优先用服务端 usage，没有就估算。"""
+        return compute_usage(
+            self.messages,
+            self._system_prompt,
+            self.config.context_window,
+            api_prompt_tokens=self._api_prompt_tokens,
+            window_is_default=self.config.context_window_is_default,
+        )
+
+    def _refresh_context_usage(self) -> ContextUsage:
+        """算一次占用、发事件；刚越过阈值时补一条警告。"""
+        usage = self.context_usage()
+        self._last_usage = usage
+        newly_blocked = False
+        if usage.ratio >= self.config.context_warn_ratio and not self._needs_compact:
+            self._needs_compact = True
+            newly_blocked = True
+        self._emit(ContextUsageChanged(
+            tokens=usage.tokens, window=usage.window, percent=usage.percent,
+            source=usage.source, window_is_default=usage.window_is_default,
+            blocked=self._needs_compact))
+        if newly_blocked:
+            self._notice(
+                "上下文已占用 %.1f%%（%d / %d tokens），快到上限了。"
+                "请执行 /compact 压缩上下文；压缩完成前不再接收新提问。"
+                % (usage.percent, usage.tokens, usage.window),
+                "warning")
+        return usage
+
+    def compact(self) -> bool:
+        """手动压缩：归档 → LLM 写摘要 → 用摘要替换历史。
+
+        返回 True = 压缩成功、可以继续提问；False = 失败，历史原样保留。
+
+        整个流程有三条硬约束：
+          1. 归档不成功就不许往下走（不能拿"可能丢了原文"换一次压缩）；
+          2. 只有 LLM 摘要这一件事会发请求，且不带 tools——压缩期间不执行任何工具；
+          3. 失败不破坏历史，用户可以再来一次 /compact。
+        """
+        if self._compacting:
+            self._notice("正在压缩中，请稍候。", "warning")
+            return False
+        if not self.messages:
+            self._notice("当前没有对话历史，不需要压缩。")
+            return False
+
+        self._compacting = True
+        try:
+            # ---- 1) 先归档。写失败就停在这里，历史一个字都不动
+            self._notice("开始压缩：先把原始上下文归档…")
+            try:
+                record = archive_messages(self.messages, self.context_dir)
+            except ArchiveError as e:
+                self._notice("压缩中止：%s 原始历史保持不变，可以稍后重试 /compact。" % e,
+                             "error")
+                return False
+            self._notice("原始上下文已归档：%s（%d 条消息，编号 %s）"
+                         % (record.path, record.message_count, record.archive_id))
+
+            # ---- 2) 让 LLM 写摘要（只有这一步发请求，且不带工具）
+            summary, error = self._summarize_history()
+            if error:
+                self._notice("压缩失败：%s 原始历史保持不变，可以重试 /compact。" % error,
+                             "error")
+                return False
+
+            # ---- 3) 用摘要替换历史。System Prompt 与工具定义在请求时另拼，天然保留
+            replacement = build_summary_message(
+                summary, record.archive_id, record.created_at)
+            self.messages = [replacement]
+            self._api_prompt_tokens = None      # 旧基准作废，用量重新按摘要算
+            self._needs_compact = False
+            self._notice("压缩完成：历史已替换为摘要（约 %d 字），归档编号 %s。"
+                         "需要旧细节可以用 recallContext 检索。"
+                         % (len(summary), record.archive_id))
+            self._refresh_context_usage()
+            return True
+        finally:
+            self._compacting = False
+
+    def _summarize_history(self) -> Tuple[str, str]:
+        """发一次"只要摘要"的请求。返回 (摘要, 错误说明)，两者必有一个为空。"""
+        payload = build_compact_messages(self.messages)
+        parts: List[str] = []
+        try:
+            for delta in self.client.chat_stream(payload, self.config.model, tools=None):
+                if delta.done:
+                    break
+                if delta.content:
+                    parts.append(delta.content)
+                    # 摘要也逐片推给界面：5,000 token 要生成一阵，
+                    # 期间界面完全没动静会被当成卡死
+                    self._emit(TextDelta(delta.content))
+        except LLMError as e:
+            return "", str(e)
+        except Exception as e:      # noqa: BLE001
+            return "", "压缩请求异常（%s）：%s" % (type(e).__name__, e)
+
+        summary = "".join(parts).strip()
+        if not summary:
+            return "", "模型没有返回摘要内容。"
+        return summary, ""
 
     # ---------------------------------------------------------------- 技能刷新
 

@@ -43,6 +43,7 @@ xiaoA/
     │   ├── ports.py            对 UI 提的能力要求（EventSink / ConfirmPort）
     │   ├── session.py          对话编排：tool-calling 主循环
     │   ├── skills.py           Skill 发现与注册（只读 name/description）
+    │   ├── compact.py          上下文压缩：token 估算 / 归档 / 摘要 / 检索
     │   ├── mcp.py              MCP Client：连接外部 Server，工具动态并入注册表
     │   ├── llm/
     │   │   ├── client.py       唯一碰 http.client 的地方
@@ -58,6 +59,7 @@ xiaoA/
     │           ├── math_ops.py    isLeapYear
     │           ├── cli_ops.py     RunCli（调本机任意命令行程序）
     │           ├── skill_ops.py   loadSkill（按需加载全文/附件）+ createSkill（新建技能）
+    │           ├── context_ops.py recallContext（在压缩归档里检索原始上下文）
     │           ├── web_search.py  searchWe（联网搜索，百度千帆）
     │           ├── fetch_web.py   FetchWeb（抓网页正文 → Markdown，走本机 curl）
     │           └── fs_ops.py      10 个文件操作
@@ -146,12 +148,13 @@ python -m venv .venv
 **3. `scroll_end` 要传 `force=True`。** 它内部有"内容没变就不滚"的判断，而那个判断
 有缓存，靠不住。
 
-## 工具清单（17 个）
+## 工具清单（18 个）
 
 时间 `getDate`（调本机 date 命令）｜计算 `isLeapYear`｜
 联网 `searchWe`（搜索）`FetchWeb`（读网页正文）｜
 执行 `RunCli`（调任意本机命令行程序）｜
 技能 `loadSkill`（按需取技能全文/附件）`createSkill`（新建技能）｜
+上下文 `recallContext`（在被压缩的归档里检索原文）｜
 文件 `getCwd` `listDir` `getFileType` `readFile` `createFile` `createDir`
 `editFile` `renamePath` `deleteDir`⚠ `deleteFile`⚠
 
@@ -473,6 +476,64 @@ xiaoA 启动时读**启动目录**下的 `.mcp.json`（和技能扫描同一个"
 
 连不上的 Server 只进 problems（横幅/`--check` 一行说明原因），其余 Server、
 其余工具、整个对话完全不受影响。没装 `mcp` 库也一样：其他 17 个工具照常。
+
+## 上下文压缩与历史检索（/compact + recallContext）
+
+长任务迟早会把上下文窗口撑爆。爆了的症状不是变慢，是接口直接 400，整轮白跑。
+这一节做的事就四件：**量清楚、存下来、压成摘要、还能查回去**。
+
+### 用法
+
+- 随时输入 `/compact`：归档当前历史 → LLM 写一份摘要 → 用摘要替换历史。
+- 占用到 **70%** 时自动警告并**暂停接收新提问**，只认 `/compact`；压缩成功才解禁。
+- 状态栏一直显示：`上下文 42.3k / 128k（33%）`。窗口没配置时后面跟「默认」，
+  表示 128k 是兜底值不是模型真实值。
+
+### 四步链路
+
+1. **估量**（`compact.compute_usage`）：优先用服务端 `usage.prompt_tokens`（精确，
+   含 system 与 tools）；拿不到就本地估算（中文≈1 字 1 token、英文≈4 字符 1 token）。
+   取 `max(API 值, 估算值)`——宁可早警告，不要等 400。
+2. **归档**（`archive_messages`）：写 `<启动目录>/.agents/context/YYYYmmdd-HHMMSS.jsonl`，
+   第一行 meta（编号/时间/条数），之后每行一条消息，保留 role / content /
+   tool_calls / tool_call_id 和**原始顺序**。写完 `flush + fsync` 并读回核对行数，
+   **校验不过就中止压缩**——宁可没压缩，不能丢原文。
+3. **摘要**（`build_compact_messages` + 专用 Prompt）：把历史拍平成纯文本
+   （工具名、参数、结果都保留），system 段放压缩专用 Prompt，要求产出约 5,000 tokens
+   的 Markdown 工作摘要。这一步是压缩期间唯一允许的请求，**且不带 tools**。
+4. **替换**（`build_summary_message`）：历史换成一条 user 消息 = 摘要 + 归档说明
+   （"此前上下文已于 … 压缩，原始上下文保存在编号为 … 的归档文件中…请使用
+   recallContext 工具"）。System Prompt 和工具定义在每次请求时另拼，天然保留。
+
+失败处理：归档失败、请求失败、摘要为空——三种都**不碰历史**，报错后可以重来 `/compact`。
+
+### recallContext
+
+摘要一定丢细节（哪个错误码、哪个路径、当初怎么定的）。模型发现缺东西时调：
+
+```json
+{"text": "BACKEND_API_ERROR"}                 // 所有归档里找
+{"text": "8090", "id": "20261022-153000"}     // 只在指定归档里找
+```
+
+本地全文检索（子串、大小写不敏感），命中按次数排序，返回**归档编号 + 消息序号 +
+角色 + 原文片段**，总长度有上限（默认 4,000 字符）——检索是为补细节，不是把归档再灌回去。
+
+### 配置（config.ini 的 [context]）
+
+```ini
+[context]
+window = 128000     # 模型窗口；不写按 128000 且状态栏标「默认」
+warn_ratio = 0.70   # 告警线
+```
+
+### 取舍说明
+
+- **不用向量库/Embedding**：关键词检索 60 行就能读懂、能调试；真要语义检索，
+  换掉 `search_archives` 一个函数即可。
+- **摘要不硬校验 5,000 tokens**：给模型的是要求，实际长度由它决定；测下来中文
+  摘要通常 1k~3k tokens，已远小于原始历史。
+- **压缩只压缩历史，不压 system/tools**：模型的基本能力和工具清单不能因为压缩而变。
 
 ## 加一个新工具
 

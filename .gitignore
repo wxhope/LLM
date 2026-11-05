@@ -62,3 +62,6 @@ temp/
 Agent/xiaoA/.agents/skills/*
 # 测试运行时生成的 Word 文档等产物
 Agent/xiaoA/*.docx
+
+# ---------- xiaoA：上下文归档（会话本地数据，含完整对话，不同步）----------
+.agents/context/

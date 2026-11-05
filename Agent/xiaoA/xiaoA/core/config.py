@@ -34,11 +34,16 @@ DEFAULT_MCP_CONNECT_TIMEOUT = 10.0
 DEFAULT_MCP_CALL_TIMEOUT = 60.0
 DEFAULT_MCP_MAX_CHARS = 8000
 
+# 上下文窗口：拿不到模型真实值时用 128k（题目要求），并在界面上标「默认」
+DEFAULT_CONTEXT_WINDOW = 128000
+DEFAULT_CONTEXT_WARN_RATIO = 0.70
+
 REQUIRED_SECTION = "deepseek"
 SEARCH_SECTION = "search"
 FETCH_SECTION = "fetch"
 CLI_SECTION = "cli"
 MCP_SECTION = "mcp"
+CONTEXT_SECTION = "context"
 
 # 占位符：填这几个等于没填
 _PLACEHOLDERS = ("你的key", "你的百度千帆key", "your_api_key", "xxx")
@@ -72,6 +77,10 @@ class AppConfig:
     mcp_connect_timeout: float = DEFAULT_MCP_CONNECT_TIMEOUT
     mcp_call_timeout: float = DEFAULT_MCP_CALL_TIMEOUT
     mcp_max_chars: int = DEFAULT_MCP_MAX_CHARS
+    # 上下文窗口与告警线（窗口没配时用 128k，界面标「默认」）
+    context_window: int = DEFAULT_CONTEXT_WINDOW
+    context_window_is_default: bool = True
+    context_warn_ratio: float = DEFAULT_CONTEXT_WARN_RATIO
 
     def masked_key(self) -> str:
         """给界面展示用：只露头尾，别把 key 打在屏幕上。"""
@@ -239,6 +248,28 @@ def load_config(path: Optional[str] = None) -> AppConfig:
             except ValueError:
                 raise ConfigError("配置里的 [%s] max_chars 不是整数：%s" % (MCP_SECTION, raw))
 
+    # ---- 上下文窗口：可选。没写就用 128k，并记住"这是默认值"以便界面标注
+    context_window = DEFAULT_CONTEXT_WINDOW
+    context_window_is_default = True
+    context_warn_ratio = DEFAULT_CONTEXT_WARN_RATIO
+    if cfg.has_section(CONTEXT_SECTION):
+        raw = (cfg.get(CONTEXT_SECTION, "window", fallback="") or "").strip()
+        if raw:
+            try:
+                context_window = max(1000, int(raw))
+                context_window_is_default = False
+            except ValueError:
+                raise ConfigError("配置里的 [%s] window 不是整数：%s" % (CONTEXT_SECTION, raw))
+        raw = (cfg.get(CONTEXT_SECTION, "warn_ratio", fallback="") or "").strip()
+        if raw:
+            try:
+                context_warn_ratio = float(raw)
+            except ValueError:
+                raise ConfigError("配置里的 [%s] warn_ratio 不是数字：%s" % (CONTEXT_SECTION, raw))
+            if not 0.1 <= context_warn_ratio <= 0.95:
+                raise ConfigError("配置里的 [%s] warn_ratio 应在 0.1~0.95 之间：%s"
+                                  % (CONTEXT_SECTION, raw))
+
     return AppConfig(
         api_key=api_key,
         base_url=base_url.rstrip("/"),
@@ -258,4 +289,7 @@ def load_config(path: Optional[str] = None) -> AppConfig:
         mcp_connect_timeout=mcp_connect_timeout,
         mcp_call_timeout=mcp_call_timeout,
         mcp_max_chars=mcp_max_chars,
+        context_window=context_window,
+        context_window_is_default=context_window_is_default,
+        context_warn_ratio=context_warn_ratio,
     )
