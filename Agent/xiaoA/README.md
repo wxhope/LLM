@@ -42,6 +42,7 @@ xiaoA/
     │   ├── events.py           往 UI 发的消息（TextDelta / ToolCallStarted / ...）
     │   ├── ports.py            对 UI 提的能力要求（EventSink / ConfirmPort）
     │   ├── session.py          对话编排：tool-calling 主循环
+    │   ├── session_store.py    会话持久化（/save /new /resume 的存取）
     │   ├── skills.py           Skill 发现与注册（只读 name/description）
     │   ├── compact.py          上下文压缩：token 估算 / 归档 / 摘要 / 检索
     │   ├── mcp.py              MCP Client：连接外部 Server，工具动态并入注册表
@@ -65,7 +66,8 @@ xiaoA/
     │           └── fs_ops.py      10 个文件操作
     └── tui/                    ★ 终端界面
         ├── bridge.py           QueueSink / TextualConfirm（线程握手）
-        ├── app.py              App 主体
+        ├── dialogs.py          模态浮层：配置提示对话框 / 会话恢复面板
+        ├── app.py              App 主体（含左侧 MCP 边栏）
         ├── app.tcss            样式，跟逻辑分开
         └── __main__.py         python -m xiaoA.tui
 ```
@@ -84,17 +86,52 @@ python -m venv .venv
 
 不用虚拟环境也行，直接 `pip install textual`。
 
+**首次运行没写 config.ini？** 程序会自动在当前目录生成一份完整的初始配置（占位 Key），
+并弹出对话框告诉你：改好 `api_key`、重启即可。配置文件按「当前目录 → 仓库根」的顺序查找，
+从别的目录（比如技能工作区）启动时，仓库根的 config.ini 依然生效，不会弹窗打扰。
+
 ## 界面操作
 
 | 操作 | 说明 |
 |---|---|
 | Enter | 发送 |
 | Shift+Enter | 换行（输入多行） |
-| `/help` `/clear` `/quit` `/model` `/tools` | 命令 |
-| Ctrl+Q / Ctrl+L / Ctrl+T / F1 | 快捷键 |
+| 输入 `/` | 弹出命令补全面板，Tab 选中第一个候选 |
+| Ctrl+Q / Ctrl+L / Ctrl+R / Ctrl+T / F1 | 快捷键 |
 | y / n | 删除确认时回答（默认 n） |
 
+### 斜杠命令
+
+| 命令 | 说明 |
+|---|---|
+| `/help` | 查看全部命令 |
+| `/new` | 新建会话（当前会话**自动保存**，AGENTS.md 重新注入） |
+| `/resume` | 弹出历史会话列表面板：↑/↓ 选择、Enter 恢复、ESC 取消 |
+| `/save` | 保存当前会话到 `.agents/sessions/` |
+| `/sessions` | 列出已保存的会话 |
+| `/clear` | 清空当前历史（不保存） |
+| `/compact` | 压缩上下文（见下文） |
+| `/model` `/tools` `/mcp` | 查看模型 / 工具 / MCP 服务器状态 |
+| `/quit`（`/exit` `/q`） | 退出 |
+
 删除类工具会先把文件路径打在屏幕上，等你按 y 才动手——**模型没有删除权限，你有**。
+
+会话文件存在 `<启动目录>/.agents/sessions/<时间戳>.json`，完整保留消息顺序、
+工具调用参数和返回结果，恢复后连多轮工具调用都能继续接上。
+
+### 左侧边栏：MCP 服务器
+
+边栏常驻显示每台已连接的 MCP 服务器（`●`）和它提供的远端工具；
+没配置 `.mcp.json` 时显示引导文案。MCP 是**异步加载**的：界面先就绪、可以正常打字，
+后台线程连上服务器后动态刷新边栏和工具清单，连接等待不会卡住启动。
+
+## AGENTS.md：项目级约定
+
+启动目录放一个 `AGENTS.md`（项目约定、编码规范、注意事项），会话首次加载时
+它的内容会作为**首条用户消息**注入聊天历史，之后每轮请求都带着——
+"一次注入，全程复用"，位置固定在历史最前面，前缀缓存友好。
+`/clear` 和 `/new` 之后会重新注入；`/resume` 恢复的历史里已含注入，不重复。
+字符上限由 `[context] agents_md_max_chars` 控制（默认 8000）。
 
 ## 流式打字机
 

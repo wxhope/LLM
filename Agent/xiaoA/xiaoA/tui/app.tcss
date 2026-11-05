@@ -20,12 +20,42 @@ Screen {
     text-style: bold;
 }
 
+/* 中间一行：左边 MCP 边栏（固定宽），右边消息区（占满剩余） */
+#main-row {
+    height: 1fr;
+}
+
+#sidebar {
+    width: 28;
+    border-right: round $primary;
+    background: $surface;
+}
+
+#sidebar-title {
+    height: 1;
+    background: $panel;
+    color: $text;
+    padding: 0 1;
+    text-style: bold;
+}
+
+#sidebar-body {
+    height: 1fr;
+}
+
+#sidebar-mcp {
+    width: 100%;
+    padding: 0 1;
+    color: $text-muted;
+}
+
 /* 消息区：一条消息一个 Message（Static），可滚动、可选中复制。
  *
  * 为什么不用 RichLog：它只能追加整行，写进去就改不了；
  * 逐字输出必须能反复重写"最后那一条"，所以换成 VerticalScroll + Static。
  */
 #transcript {
+    width: 1fr;
     height: 1fr;
     border: round $primary;
     background: $surface;
@@ -38,6 +68,20 @@ Screen {
 #transcript > .msg {
     width: 100%;
     height: auto;
+}
+
+/* 命令补全面板：默认藏起来，输入 / 时由 app 挂上 visible（Textual CSS
+   不支持 :not()，所以用正向 class 切换） */
+#cmd-panel {
+    height: auto;
+    display: none;
+    background: $panel;
+    color: $accent;
+    padding: 0 1;
+}
+
+#cmd-panel.visible {
+    display: block;
 }
 
 #status {
@@ -61,4 +105,63 @@ Screen {
     height: 1;
     color: $text-muted;
     padding: 0 1;
+}
+
+/* ---- 模态浮层：屏幕级居中（Textual 的 margin 不支持 auto）---- */
+NoticeDialog {
+    align: center middle;
+}
+
+ResumePanel {
+    align: center middle;
+}
+
+#dialog-box {
+    width: 64;
+    height: auto;
+    max-height: 80%;
+    border: round $accent;
+    background: $surface;
+    padding: 1 2;
+}
+
+#dialog-title {
+    text-style: bold;
+    color: $warning;
+    margin-bottom: 1;
+}
+
+#dialog-body {
+    height: auto;
+    max-height: 14;
+    margin-bottom: 1;
+}
+
+#dialog-ok {
+    width: auto;
+}
+
+/* ---- 历史会话恢复面板 ---- */
+#resume-box {
+    width: 84;
+    height: 18;
+    border: round $accent;
+    background: $surface;
+    padding: 1 2;
+}
+
+#resume-title {
+    text-style: bold;
+    margin-bottom: 1;
+}
+
+#resume-list {
+    height: 1fr;
+    border: round $primary;
+}
+
+#resume-hint {
+    height: 1;
+    color: $text-muted;
+    margin-top: 1;
 }

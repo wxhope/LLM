@@ -41,8 +41,19 @@ from .events import (
 from .llm import AssistantMessage, LLMClient, LLMError, StreamDelta, ToolCall
 from .mcp import McpManager, load_mcp_manager
 from .ports import ConfirmPort, EventSink
+from .session_store import sessions_dir
 from .skills import STARTUP_CWD, SkillCatalog, discover_skills
 from .tools import DangerLevel, ToolContext, ToolRegistry, build_default_registry
+
+AGENTS_MD_FILENAME = "AGENTS.md"
+
+# AGENTS.md 作为一条 user 消息注入时的包装文案。
+# 为什么是 user 消息而不是 system：system 每次请求都要整体重发且不可变，
+# 项目说明属于"随项目变的上下文"，放进历史开头正好一次注入、全程复用，
+# 也不用改动 system prompt 的缓存形态。
+AGENTS_MD_TEMPLATE = (
+    "以下是本项目根目录 AGENTS.md 里的约定，请在整个会话过程中遵守：\n\n%s"
+)
 
 SYSTEM_PROMPT = (
     "你是一个运行在用户本机的命令行助手，可以调用工具查看和修改本地文件，也可以联网搜索。"
@@ -84,6 +95,25 @@ def build_system_prompt(skills: Optional[SkillCatalog] = None) -> str:
     listing = "\n".join(
         '- "%s"：%s' % (s.name, s.description) for s in skills.skills)
     return SYSTEM_PROMPT + SKILL_PROMPT_SECTION % listing
+
+
+def read_agents_md(root: Optional[str] = None,
+                   max_chars: int = 8000) -> Optional[str]:
+    """读项目根的 AGENTS.md。没有返回 None；过大截断并注明。"""
+    path = os.path.join(root or STARTUP_CWD, AGENTS_MD_FILENAME)
+    if not os.path.isfile(path):
+        return None
+    try:
+        with open(path, "r", encoding="utf-8-sig") as f:
+            text = f.read(max_chars + 1)
+    except (OSError, UnicodeDecodeError):
+        return None                     # 读不了当没有，不让整个会话起不来
+    if not text.strip():
+        return None
+    if len(text) > max_chars:
+        text = text[:max_chars] + "\n\n（AGENTS.md 超过 %d 字符，已截断；全文见 %s）" % (
+            max_chars, path)
+    return text
 
 
 @dataclass
@@ -137,16 +167,54 @@ class Session:
         # ---- 上下文管理（压缩 / 用量监控 / 归档检索）
         # 归档目录：<启动目录>/.agents/context，和技能目录同一个项目根
         self.context_dir = context_dir or context_dir_of(STARTUP_CWD)
+        # 会话存档目录：<启动目录>/.agents/sessions（/save /new /resume 用）
+        self.sessions_dir = sessions_dir(STARTUP_CWD)
         self._compacting = False           # 正在压缩：期间不接提问、不跑工具
         self._needs_compact = False        # 已到阈值：暂停接收新提问，等 /compact
         self._api_prompt_tokens: Optional[int] = None   # 上一次请求服务端报的用量
         self._last_usage: Optional[ContextUsage] = None
+
+        # AGENTS.md 一次注入，全程复用：作为首条 user 消息进历史，
+        # 之后每轮请求都带着它（位置固定在历史最前面，前缀缓存友好）。
+        # /clear、/new 之后重新注入；/resume 恢复的历史里已含注入，不重复。
+        self.inject_agents_md()
 
     # ---------------------------------------------------------------- 生命周期
 
     def attach(self, sink: EventSink) -> None:
         """界面启动后把自己的 sink 接上来。"""
         self.sink = sink
+
+    def inject_agents_md(self) -> bool:
+        """把项目 AGENTS.md 注入历史开头（幂等：重复调用不会注入两份）。"""
+        if any(m.get("role") == "user" and "AGENTS.md" in str(m.get("content") or "")[:60]
+               for m in self.messages):
+            return False
+        text = read_agents_md(STARTUP_CWD, self.config.agents_md_max_chars)
+        if text is None:
+            return False
+        self.messages.insert(0, {"role": "user",
+                                 "content": AGENTS_MD_TEMPLATE % text})
+        self._emit(Notice("已加载项目 AGENTS.md（%d 字符），会话全程遵守。" % len(text)))
+        return True
+
+    def attach_mcp(self, manager) -> List[str]:
+        """把 MCP manager 的工具并入注册表（TUI 异步加载完成后调用）。
+
+        返回新增的工具名列表。注册失败（重名等极端情况）记进 problems，
+        不影响其他工具——和启动时挂载的失败哲学一致。
+        """
+        if manager is None:
+            return []
+        self.mcp = manager
+        added: List[str] = []
+        for tool in manager.tools:
+            try:
+                self.registry.register(tool)
+                added.append(tool.name)
+            except ValueError as e:
+                manager.problems.append("MCP：%s" % e)
+        return added
 
     def clear(self) -> None:
         """清空历史（对应 /clear 命令）。"""
@@ -155,6 +223,8 @@ class Session:
         self._api_prompt_tokens = None
         self._needs_compact = False
         self._emit(Notice("对话历史已清空。"))
+        # 项目级约定跟会话走：清空后重新注入 AGENTS.md
+        self.inject_agents_md()
         self._refresh_context_usage()
 
     @property
@@ -539,19 +609,29 @@ class Session:
 
 def build_session(config: AppConfig, sink: Optional[EventSink] = None,
                   confirm: Optional[ConfirmPort] = None,
-                  allow_tools: bool = True) -> Session:
+                  allow_tools: bool = True,
+                  load_mcp: bool = False) -> Session:
     """给界面用的便捷构造函数。
 
-    内置工具全量 + MCP：启动目录有 .mcp.json 就连接外部 Server 并把远端
-    工具并入注册表；没有就跳过，一行多余的活都不干。
+    默认**不**在这里连 MCP：连接外部 Server 可能要等好几秒（超时更久），
+    卡在界面启动前是不对的。TUI 先把界面架起来，再在后台线程里调
+    load_mcp_manager + session.attach_mcp，加载完动态刷新边栏。
+    命令行检查（main.py --check）等一次性场景传 load_mcp=True。
     """
-    mcp = load_mcp_manager(
-        connect_timeout=config.mcp_connect_timeout,
-        call_timeout=config.mcp_call_timeout,
-    )
-    return Session(config, sink=sink, confirm=confirm, allow_tools=allow_tools,
-                   mcp=mcp)
+    mcp = None
+    registry = None
+    if load_mcp:
+        registry = build_default_registry()
+        mcp = load_mcp_manager(
+            connect_timeout=config.mcp_connect_timeout,
+            call_timeout=config.mcp_call_timeout,
+            existing_names=registry.names(),
+            desc_chars=config.mcp_desc_chars,
+        )
+    return Session(config, registry=registry, sink=sink, confirm=confirm,
+                   allow_tools=allow_tools, mcp=mcp)
 
 
 __all__ = ["Session", "TurnStats", "SYSTEM_PROMPT", "build_session",
-           "build_system_prompt", "SKILL_PROMPT_SECTION"]
+           "build_system_prompt", "SKILL_PROMPT_SECTION",
+           "read_agents_md", "AGENTS_MD_FILENAME"]

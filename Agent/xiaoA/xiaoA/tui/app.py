@@ -27,14 +27,21 @@ from __future__ import annotations
 
 import os
 import time
-from typing import Optional
+from typing import List, Optional
 
 from textual import work
 from textual.app import App, ComposeResult
-from textual.containers import Vertical, VerticalScroll
+from textual.binding import Binding
+from textual.containers import Horizontal, Vertical, VerticalScroll
 from textual.widgets import Input, Static
 
-from ..core.config import AppConfig, ConfigError, load_config
+from ..core.config import (
+    AppConfig,
+    ConfigError,
+    load_config,
+    resolve_config_path,
+    write_mock_config,
+)
 from ..core.events import (
     ContextUsageChanged,
     ErrorOccurred,
@@ -45,23 +52,33 @@ from ..core.events import (
     ToolCallFinished,
     ToolCallStarted,
 )
+from ..core.mcp import load_mcp_manager
 from ..core.session import Session, build_session
+from ..core.session_store import (
+    SessionMeta,
+    SessionStoreError,
+    list_sessions,
+    load_session,
+    save_session,
+)
 from .bridge import QueueSink, TextualConfirm
+from .dialogs import NoticeDialog, ResumePanel
 
-# 队列轮询间隔（秒）。40ms ≈ 25fps，看着顺滑又不浪费 CPU
-POLL_INTERVAL = 0.04
+# 队列轮询间隔（秒）。40ms ≈ 25fps，看着顺滑又不浪费 CPU。
+# 只是默认值：config.ini 的 [ui] poll_interval 可以改。
+DEFAULT_POLL_INTERVAL = 0.04
 
-# 打字机的加速闸门：模型一次性吐来的字如果积压超过这个数，
-# 就不再按固定速率慢慢放，而是按积压量追帧，把延迟压在几百毫秒内。
-# 没有这个兜底，模型 3 秒生成的 300 字要放 9 秒，等于把"流式"变成"回放"。
-FAST_FORWARD_CHARS = 40
-FAST_FORWARD_DIVISOR = 5      # 追帧时每帧吃掉积压的 1/5 ≈ 5 帧（200ms）追平
+# 打字机的加速闸门（默认值，config.ini [ui] fast_forward_* 可改）：
+# 模型一次性吐来的字如果积压超过这个数，就不再按固定速率慢慢放，
+# 而是按积压量追帧，把延迟压在几百毫秒内。没有这个兜底，
+# 模型 3 秒生成的 300 字要放 9 秒，等于把"流式"变成"回放"。
+DEFAULT_FAST_FORWARD_CHARS = 40
+DEFAULT_FAST_FORWARD_DIVISOR = 5      # 追帧时每帧吃掉积压的 1/5 ≈ 5 帧（200ms）追平
 
-# 收尾阶段（模型已经说完，但字还没放完）的追赶速度。
-# 3 字/帧是下限：再大就不是"逐字"，而是一帧蹦出一整段，
-# 余量小的短回答会直接闪过去，看不出打字机效果。
-DRAIN_MIN_STEP = 3
-DRAIN_DIVISOR = 8             # 每帧吃掉积压的 1/8 ≈ 8 帧（320ms）追平
+# 收尾阶段（模型已经说完，但字还没放完）的追赶速度（默认值，[ui] drain_* 可改）。
+# 3 字/帧是下限：再大就不是"逐字"，余量小的短回答会直接闪过去。
+DEFAULT_DRAIN_MIN_STEP = 3
+DEFAULT_DRAIN_DIVISOR = 8             # 每帧吃掉积压的 1/8 ≈ 8 帧（320ms）追平
 
 # 光标：只在生成过程中挂在末尾，定格时去掉
 CURSOR = "▍"
@@ -69,6 +86,35 @@ CURSOR = "▍"
 # 助手消息的行首前缀。续行用等宽空格补齐，避免换行后顶格成新段落。
 PREFIX = "xiaoA ▸ "
 PREFIX_WIDTH = len(PREFIX)
+
+# 斜杠命令表：命令 → 一句话说明。/help、补全面板、命令分发共用这一份，
+# 加命令只改这里（再在 handle_command 里加一个分支）。
+COMMANDS = [
+    ("/help", "查看帮助"),
+    ("/new", "新建会话（自动保存当前会话）"),
+    ("/resume", "恢复历史会话（面板里选择）"),
+    ("/save", "保存当前会话"),
+    ("/sessions", "列出已保存的会话"),
+    ("/clear", "清空当前历史（不保存）"),
+    ("/compact", "压缩上下文"),
+    ("/model", "查看模型配置"),
+    ("/tools", "列出全部工具"),
+    ("/mcp", "查看 MCP 服务器与工具"),
+    ("/quit", "退出 xiaoA"),
+]
+# 别名：敲着顺手而已，不算独立命令
+COMMAND_ALIASES = {"/exit": "/quit", "/q": "/quit"}
+
+HELP_TEXT = "命令：" + "  ".join("%s %s" % (c, d) for c, d in COMMANDS)
+
+MOCK_DIALOG_BODY = (
+    "启动目录下没有 config.ini，xiaoA 已自动生成一份初始配置：\n\n"
+    "    {path}\n\n"
+    "里面的 api_key 是占位符，现在还不能正常对话。\n"
+    "请用编辑器打开它，把 api_key 换成你自己的 Key，\n"
+    "然后退出并重新启动 xiaoA 即可。\n\n"
+    "配置项的详细说明见项目里的 config.example.ini 与 README。"
+)
 
 
 def fmt_k(tokens: int) -> str:
@@ -139,10 +185,13 @@ class XiaoAApp(App):
     TITLE = "xiaoA · 本机助手"
     SUB_TITLE = "core + tui 分层架构"
     BINDINGS = [
-        ("ctrl+q", "quit_app", "退出"),
-        ("ctrl+l", "clear_history", "清空历史"),
-        ("ctrl+t", "show_tools", "工具清单"),
-        ("f1", "show_help", "帮助"),
+        Binding("ctrl+q", "quit_app", "退出"),
+        Binding("ctrl+l", "clear_history", "清空历史"),
+        Binding("ctrl+t", "show_tools", "工具清单"),
+        Binding("ctrl+r", "resume_session", "恢复会话"),
+        Binding("f1", "show_help", "帮助"),
+        # Tab：命令补全面板可见时，补全成选中的命令
+        Binding("tab", "complete_command", "补全命令", priority=True),
     ]
 
     def __init__(self, config: Optional[AppConfig] = None,
@@ -157,11 +206,23 @@ class XiaoAApp(App):
         self._started_at = time.time()
         self._pending_confirm = False          # 有一个确认框正等着回答
 
+        # ---- 界面节奏参数：默认值 + config.ini [ui] 覆盖
+        # 属性里带实例值而不是读模块常量，配置才能真正生效
+        self._poll_interval = DEFAULT_POLL_INTERVAL
+        self._ff_chars = DEFAULT_FAST_FORWARD_CHARS
+        self._ff_div = DEFAULT_FAST_FORWARD_DIVISOR
+        self._drain_min = DEFAULT_DRAIN_MIN_STEP
+        self._drain_div = DEFAULT_DRAIN_DIVISOR
+
+        # ---- 命令补全面板
+        self._cmd_matches: List[tuple] = []    # 当前补全候选 [(命令, 说明), …]
+
         # ---- 上下文占用（状态栏显示 + 到阈值后拦输入）
         self._ctx_text = ""                    # 例如 "上下文 42.3k / 128k（33%）默认"
         self._ctx_blocked = False              # True = 等 /compact，暂停接收提问
         self._status_text = "启动中"
         self.status_line = ""                  # 状态栏最后渲染的那一行（便于测试）
+        self._config_missing = False           # 刚生成了 mock 配置，等用户改完重启
 
         # ---- 流式状态（逐字输出）
         # 收到 = _live_target（模型已经推来的全文）
@@ -180,38 +241,86 @@ class XiaoAApp(App):
     def compose(self) -> ComposeResult:
         with Vertical():
             yield HeaderBar(id="header-bar")
-            # 消息区：VerticalScroll 里一条消息一个 Static。
-            # 用它可以"重写最后一条"，RichLog 不行（它只认追加整行）。
-            yield VerticalScroll(id="transcript")
+            # 中间一行 = 边栏（MCP 服务器/工具） + 消息区。
+            # 边栏常驻：没配 MCP 时显示引导文案，配了就动态刷新。
+            with Horizontal(id="main-row"):
+                with Vertical(id="sidebar"):
+                    yield Static(" MCP 服务器", id="sidebar-title")
+                    yield VerticalScroll(
+                        Static("（启动中…）", id="sidebar-mcp"),
+                        id="sidebar-body",
+                    )
+                # 消息区：VerticalScroll 里一条消息一个 Static。
+                # 用它可以"重写最后一条"，RichLog 不行（它只认追加整行）。
+                yield VerticalScroll(id="transcript")
+            # 命令补全面板：输入 / 时浮出来，平时隐藏
+            yield Static("", id="cmd-panel")
             yield StatusBar(id="status")
             yield Input(placeholder="说点什么，Enter 发送，Shift+Enter 换行…",
                         id="composer")
             yield Static(HELP_TEXT, id="hint")
 
     async def on_mount(self) -> None:
-        # 1) 读配置。失败不退出程序，而是把错误显示在界面上——
+        # 1) 找配置：启动目录 → 仓库根 → 都没有就生成一份 mock 并弹窗。
+        #    失败不退出程序，而是把错误显示在界面上——
         #    用户看到的是"红字提示"，不是"窗口一闪而过"。
-        #    这个方法必须是 async：sync 版的 on_mount 里调 @work 不会被派发。
+        config_path = (self._config_path
+                       if self._config_path
+                       else resolve_config_path())
+        if config_path is None:
+            # 首次运行：在当前目录生成完整初始配置（mock 信息），
+            # 弹对话框告诉用户改完重启。这个方法必须是 async：
+            # sync 版的 on_mount 里调 @work 不会被派发。
+            try:
+                config_path = write_mock_config(
+                    os.path.join(os.getcwd(), "config.ini"))
+            except OSError as e:
+                self.refresh_header("未加载配置")
+                self.write_error("自动生成 config.ini 失败：%s" % e)
+                self.query_one("#composer", Input).disabled = True
+                self.set_status("配置缺失")
+                return
+            self._config_missing = True
+            self.refresh_header("未加载配置")
+            self.write_notice("已在当前目录生成初始配置：%s" % config_path)
+            self.query_one("#composer", Input).disabled = True
+            self.set_status("等待配置")
+            self.render_sidebar()
+            self.push_screen(NoticeDialog(
+                "⚠ 需要填写 API Key",
+                MOCK_DIALOG_BODY.replace("{path}", config_path)))
+            self.set_interval(self._poll_interval, self.pump_events)
+            return
+
         try:
-            self.config_obj = self.config_obj or load_config(self._config_path)
+            self.config_obj = self.config_obj or load_config(config_path)
         except ConfigError as e:
             self.refresh_header("未加载配置")
             self.write_error(str(e))
             self.write_notice("修好 config.ini 后重启程序即可。")
             self.set_status("配置缺失")
             self.query_one("#composer", Input).disabled = True
+            self.render_sidebar()
             return
+
+        # 配置里的界面参数覆盖默认值
+        self._poll_interval = self.config_obj.ui_poll_interval
+        self._ff_chars = self.config_obj.ui_fast_forward_chars
+        self._ff_div = self.config_obj.ui_fast_forward_divisor
+        self._drain_min = self.config_obj.ui_drain_min_step
+        self._drain_div = self.config_obj.ui_drain_divisor
 
         # 2) 装配 core：注入 sink 与 confirm，session 本身不知道 Textual 存在。
         #    已经预置了 session 的（测试 / 自定义客户端）不覆盖，只补上 sink。
+        #    注意这里不连 MCP：连接外部 Server 可能要等好几秒，
+        #    卡在界面出现之前是错的，所以界面先就绪，MCP 后台加载。
         if self.session is None:
             self.session = build_session(
                 self.config_obj, sink=self.sink, confirm=self.confirm_port)
-            registry = self.session.registry
         else:
             self.session.sink = self.sink
             self.session.confirm = self.confirm_port
-            registry = self.session.registry
+        registry = self.session.registry
 
         self.refresh_header()
         self._type_delay = self.config_obj.type_delay
@@ -221,17 +330,95 @@ class XiaoAApp(App):
             self.write_notice(self.session.skills.summary())
             for problem in self.session.skills.problems:
                 self.write_notice("技能提醒：%s" % problem)
-        if self.session.mcp is not None:
-            self.write_notice(self.session.mcp.summary)
-            for problem in self.session.mcp.problems:
-                self.write_notice("MCP提醒：%s" % problem)
         # 上下文占用：先把当前值算出来贴到状态栏（空历史就是 0）
         self._sync_context_usage()
         self.set_status("空闲")
         self.query_one("#composer", Input).focus()
 
-        # 3) 开始轮询队列
-        self.set_interval(POLL_INTERVAL, self.pump_events)
+        # 3) MCP 异步加载：后台线程连接外部 Server（可能等好几秒），
+        #    完成后 _mcp_loaded 回主线程挂载工具、刷新边栏。
+        #    没配 .mcp.json 时它会立刻返回，边栏显示引导文案。
+        self.render_sidebar()
+        self.run_mcp_load()
+
+        # 4) 开始轮询队列（间隔来自 [ui] poll_interval）
+        self.set_interval(self._poll_interval, self.pump_events)
+
+    # ---------------------------------------------------------------- MCP 异步加载
+
+    @work(thread=True, exclusive=True, group="mcp")
+    def run_mcp_load(self) -> None:
+        """后台线程连接 .mcp.json 里的 Server（可能要等好几秒）。
+
+        界面在此之前就已就绪、可以正常打字——这就是"异步加载"的意义。
+        线程里绝不碰控件，结果一律 call_from_thread 回主线程。
+        """
+        mgr = None
+        error = ""
+        try:
+            mgr = load_mcp_manager(
+                connect_timeout=self.config_obj.mcp_connect_timeout,
+                call_timeout=self.config_obj.mcp_call_timeout,
+                # 传上本地工具名：远端撞名时自动加服务器前缀
+                existing_names=self.session.registry.names(),
+                desc_chars=self.config_obj.mcp_desc_chars,
+            )
+        except Exception as e:  # noqa: BLE001 —— 加载失败不能炸掉界面
+            error = "MCP 加载出现未预期错误：%s" % e
+        self.call_from_thread(self._mcp_loaded, mgr, error)
+
+    def _mcp_loaded(self, mgr, error: str = "") -> None:
+        """MCP 加载完成（成功/失败/未配置都会走到这里）：挂载 + 刷新边栏。"""
+        if error:
+            self.write_error(error)
+        if mgr is not None:
+            added = self.session.attach_mcp(mgr)
+            if added:
+                self.write_notice(mgr.summary)
+            for problem in mgr.problems:
+                self.write_notice("MCP提醒：%s" % problem)
+        self.render_sidebar()
+        self.refresh_header()
+
+    # ---------------------------------------------------------------- MCP 边栏
+
+    def render_sidebar(self) -> None:
+        """刷新左侧 MCP 边栏：每台服务器 + 它提供的工具。
+
+        没配置时显示一段引导文案，而不是空白——空白让人分不清
+        "没配置"和"加载中"。
+        """
+        lines: List[str] = []
+        mgr = self.session.mcp if self.session else None
+        if mgr is None:
+            lines = [
+                "（未配置）",
+                "",
+                "在启动目录放 .mcp.json：",
+                "",
+                '{"mcpServers": {',
+                '  "PetHospital": {',
+                '    "url": "http://…/mcp"',
+                "  }",
+                "}}",
+                "",
+                "重启后自动挂载，远端工具",
+                "和本地工具一样参与调用。",
+            ]
+        else:
+            by_server: dict = {}
+            for info in mgr.infos:
+                by_server.setdefault(info.server, []).append(info.exposed)
+            connected = {c.config.name for c in mgr.connections}
+            for name in by_server:
+                mark = "●" if name in connected else "○"
+                lines.append("%s %s" % (mark, name))
+                lines.extend("  " + t for t in by_server[name])
+            if not by_server:
+                lines.append("（没有可用的远端工具）")
+            for p in mgr.problems:
+                lines.append("⚠ " + p.replace("\n", " ")[:80])
+        self.query_one("#sidebar-mcp", Static).update("\n".join(lines) or "（空）")
 
     # ---------------------------------------------------------------- 事件排空
 
@@ -341,17 +528,17 @@ class XiaoAApp(App):
             step = backlog            # 配置关掉了打字机，一次到底
         else:
             # 用小数余额累积，否则 int(0.04/0.03)=1 会把 33 字/秒压成 25 字/秒
-            self._credit += POLL_INTERVAL
+            self._credit += self._poll_interval
             step = int(self._credit / self._type_delay)
             if step > 0:
                 self._credit -= step * self._type_delay
             if self._live_drain:
-                # 模型已经说完，剩下的别让用户干等：8 帧内追平
-                step = max(DRAIN_MIN_STEP, step, backlog // DRAIN_DIVISOR)
-            elif backlog > FAST_FORWARD_CHARS:
+                # 模型已经说完，剩下的别让用户干等：几帧内追平
+                step = max(self._drain_min, step, backlog // self._drain_div)
+            elif backlog > self._ff_chars:
                 # 关键：显示速度不能长期慢于模型吐字速度，
                 # 否则回答结束了还在"回放"，流式就白做了。
-                step = max(step, backlog // FAST_FORWARD_DIVISOR)
+                step = max(step, backlog // self._ff_div)
 
         if step <= 0:
             return
@@ -496,6 +683,42 @@ class XiaoAApp(App):
 
     # ---------------------------------------------------------------- 输入
 
+    # ---------------------------------------------------------------- 命令补全面板
+
+    def on_input_changed(self, event: Input.Changed) -> None:
+        """输入内容变化：以 / 开头且还没打空格时，弹出命令补全面板。"""
+        self._update_cmd_panel(event.value)
+
+    def _update_cmd_panel(self, value: str) -> None:
+        try:
+            panel = self.query_one("#cmd-panel", Static)
+        except Exception:            # noqa: BLE001 - 界面还没挂载完时别炸
+            return
+        text = (value or "").strip()
+        if (not text.startswith("/") or " " in text
+                or self._pending_confirm or self._config_missing):
+            self._cmd_matches = []
+            panel.remove_class("visible")
+            return
+        lowered = text.lower()
+        self._cmd_matches = [(c, d) for c, d in COMMANDS if c.startswith(lowered)]
+        if self._cmd_matches:
+            panel.update("命令补全（Tab 选中第一个）  " +
+                         "  ".join("%s %s" % (c, d) for c, d in self._cmd_matches))
+            panel.add_class("visible")
+        else:
+            self._cmd_matches = []
+            panel.remove_class("visible")
+
+    def action_complete_command(self) -> None:
+        """Tab：补全成候选里的第一个命令。没有候选时不抢 Tab 的原行为。"""
+        if not self._cmd_matches:
+            return
+        box = self.query_one("#composer", Input)
+        box.value = self._cmd_matches[0][0] + " "
+        box.cursor_position = len(box.value)
+        self._update_cmd_panel(box.value)
+
     def on_input_submitted(self, event: Input.Submitted) -> None:
         # 兼容不同 Textual 版本：有的版本 Submitted 带 value，有的要回读控件
         text = (getattr(event, "value", "") or event.input.value or "").strip()
@@ -579,9 +802,19 @@ class XiaoAApp(App):
 
     def handle_command(self, text: str) -> None:
         name, _, rest = text.partition(" ")
-        cmd = name.lower()
-        if cmd in ("/quit", "/exit", "/q"):
+        cmd = COMMAND_ALIASES.get(name.lower(), name.lower())
+        if cmd == "/quit":
             self.action_quit_app()
+        elif cmd == "/new":
+            self.cmd_new_session()
+        elif cmd == "/resume":
+            self.cmd_resume()
+        elif cmd == "/save":
+            self.cmd_save()
+        elif cmd == "/sessions":
+            self.cmd_list_sessions()
+        elif cmd == "/mcp":
+            self.cmd_show_mcp()
         elif cmd == "/clear":
             if self.session is not None:
                 self.session.clear()
@@ -603,11 +836,137 @@ class XiaoAApp(App):
                                      self.config_obj.base_url,
                                      self.config_obj.masked_key()))
         else:
-            self.write_notice("不认识的命令：%s（/help 看帮助）" % name)
+            self.write_notice("不认识的命令：%s（/help 看全部命令）" % name)
+
+    # ---- 会话管理命令（/save /new /resume /sessions）
+
+    def _save_current(self, prefix: str) -> Optional[SessionMeta]:
+        """把当前会话存盘。成功返回元信息，失败写错误并返回 None。"""
+        try:
+            meta = save_session(self.session.messages, self.session.sessions_dir)
+        except SessionStoreError as e:
+            self.write_error("%s失败：%s" % (prefix, e))
+            return None
+        self.write_notice("%s成功：%s（%d 条消息，标题「%s」）"
+                          % (prefix, meta.session_id, meta.message_count, meta.title))
+        return meta
+
+    def cmd_save(self) -> None:
+        if self.session is None:
+            return
+        if not self.session.messages:
+            self.write_notice("当前没有对话内容，没什么可保存的。")
+            return
+        self._save_current("会话保存")
+
+    def cmd_new_session(self) -> None:
+        """/new：先自动保存当前会话，再开一个全新的（AGENTS.md 重新注入）。"""
+        if self.session is None:
+            return
+        if self.busy:
+            self.write_notice("上一句还在处理中，等它结束再新建会话。")
+            return
+        if self.session.messages:
+            self._save_current("自动保存当前会话")
+        self.session.messages.clear()
+        self.session._api_prompt_tokens = None
+        self.session._needs_compact = False
+        self.session.inject_agents_md()
+        self.finish_stream()
+        self.transcript.remove_children()
+        self.write_notice("新会话已开始。")
+        self._sync_context_usage()
+        self.set_status("空闲")
+
+    def cmd_resume(self) -> None:
+        """/resume：列出历史会话，弹出面板让用户挑一个恢复。"""
+        if self.session is None:
+            return
+        if self.busy:
+            self.write_notice("上一句还在处理中，稍等再恢复会话。")
+            return
+        metas = list_sessions(self.session.sessions_dir)
+        if not metas:
+            self.write_notice("还没有保存过会话（目录 %s）。先用 /save 存一个。"
+                              % self.session.sessions_dir)
+            return
+        self.push_screen(ResumePanel(metas), self._resume_selected)
+
+    def _resume_selected(self, meta: Optional[SessionMeta]) -> None:
+        """面板回调：meta=None 表示用户按了 ESC。"""
+        if meta is None:
+            self.write_notice("已取消恢复。")
+            return
+        try:
+            msgs = load_session(meta.path)
+        except SessionStoreError as e:
+            self.write_error(str(e))
+            return
+        # 当前会话先存一份：恢复失败或用户后悔都找得回来
+        if self.session.messages:
+            self._save_current("当前会话自动保存")
+        self.session.messages = msgs
+        self.session._api_prompt_tokens = None
+        self.session._needs_compact = False
+        self.finish_stream()
+        self.transcript.remove_children()
+        self.write_notice("已恢复会话 %s「%s」（%d 条消息）。"
+                          % (meta.session_id, meta.title, len(msgs)))
+        # 把历史画回消息区：对话内容完整回放，工具轮次只显示摘要行
+        for m in msgs:
+            role = m.get("role")
+            content = str(m.get("content") or "")
+            if role == "user" and "AGENTS.md" in content[:60]:
+                self.write_notice("· [历史] 已注入项目 AGENTS.md")
+            elif role == "user":
+                self.write("你▸ " + content)
+            elif role == "assistant":
+                calls = m.get("tool_calls") or []
+                if calls:
+                    names = "、".join(
+                        (tc.get("function") or {}).get("name", "?") for tc in calls)
+                    self.write("  ⚙ [历史] 调用工具：%s" % names)
+                    if content:
+                        self.write(PREFIX + content)
+                else:
+                    self.write(PREFIX + content)
+            elif role == "tool":
+                first = content.splitlines()[0][:100] if content else "（空）"
+                self.write("  ✓ [历史] " + first)
+        self._sync_context_usage()
+        self.set_status("空闲")
+
+    def action_resume_session(self) -> None:
+        """Ctrl+R 快捷键 = /resume。"""
+        self.cmd_resume()
+
+    def cmd_list_sessions(self) -> None:
+        if self.session is None:
+            return
+        metas = list_sessions(self.session.sessions_dir)
+        if not metas:
+            self.write_notice("还没有保存过会话（目录 %s）。" % self.session.sessions_dir)
+            return
+        self.write_notice("已保存的会话（%d 个，最新在上）：" % len(metas))
+        for m in metas:
+            self.write("  %s ｜ %2d 条 ｜ %s" % (m.session_id, m.message_count, m.title))
+        self.write_notice("输入 /resume 可在面板中选择恢复。")
+
+    def cmd_show_mcp(self) -> None:
+        mgr = self.session.mcp if self.session else None
+        if mgr is None:
+            self.write_notice("MCP：未配置。在启动目录放 .mcp.json 并重启即可挂载外部 Server。")
+            return
+        self.write_notice(mgr.summary)
+        for info in mgr.infos:
+            self.write("  %s → %s.%s" % (info.exposed, info.server, info.original))
+        for p in mgr.problems:
+            self.write_notice("MCP提醒：%s" % p)
 
     def action_show_help(self) -> None:
         self.write_notice("命令：" + HELP_TEXT.replace("命令：", ""))
-        self.write_notice("快捷键：Ctrl+Q 退出 │ Ctrl+L 清空 │ Ctrl+T 工具清单 │ F1 帮助")
+        self.write_notice("快捷键：Ctrl+Q 退出 │ Ctrl+L 清空 │ Ctrl+R 恢复会话 │ "
+                          "Ctrl+T 工具清单 │ Tab 补全命令 │ F1 帮助")
 
     def action_show_tools(self) -> None:
         if self.session is None:

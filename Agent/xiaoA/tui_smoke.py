@@ -295,6 +295,72 @@ async def case_compact() -> None:
         check("压缩后解除阻断", not app.session.blocked)
 
 
+async def case_sessions() -> None:
+    print("\n【场景七】命令补全面板 + /save /new /resume")
+    tmp = tempfile.mkdtemp(prefix="xiaoA_tui_sess_")
+    client = FakeClient([text_deltas("第一段回答。"), text_deltas("第二段回答。")])
+    app = make_app(ToolRegistry([]), client)
+    app.session.sessions_dir = tmp          # 会话存到临时目录，不碰真实数据
+    async with app.run_test(size=(110, 32)) as pilot:
+        await settle(pilot, 5)
+        # ---- 补全面板：敲 / 就该浮出来，Tab 能补全
+        app.query_one("#composer").value = "/s"
+        await settle(pilot, 3)
+        panel = app.query_one("#cmd-panel")
+        check("输入 /s 弹出补全面板", panel.has_class("visible"))
+        check("候选里包含 /save 与 /sessions",
+              "/save" in str(panel.render()) and "/sessions" in str(panel.render()))
+        await pilot.press("tab")
+        await settle(pilot, 3)
+        check("Tab 补全成第一个候选", app.query_one("#composer").value.startswith("/save"))
+        # ---- 对话一轮，/save 落盘
+        app.query_one("#composer").value = "第一句话"
+        await pilot.press("enter")
+        await settle(pilot, 30)
+        app.query_one("#composer").value = "/save"
+        await pilot.press("enter")
+        await settle(pilot, 10)
+        from xiaoA.core.session_store import list_sessions
+        metas = list_sessions(tmp)
+        check("会话已保存", len(metas) == 1 and metas[0].message_count >= 2,
+              "存了 %d 个" % len(metas))
+        # ---- /new：自动保存当前，历史清零
+        app.query_one("#composer").value = "第二句话"
+        await pilot.press("enter")
+        await settle(pilot, 30)
+        app.query_one("#composer").value = "/new"
+        await pilot.press("enter")
+        await settle(pilot, 10)
+        check("/new 自动保存了旧会话", len(list_sessions(tmp)) == 2)
+        check("/new 清空了历史", app.session.messages == [], str(app.session.messages)[:60])
+        check("/new 后消息区已清屏",
+              "第一段回答" not in screen_text(app))
+        # ---- /resume：面板出现，ESC 取消
+        app.query_one("#composer").value = "/resume"
+        await pilot.press("enter")
+        await settle(pilot, 10)
+        check("恢复面板弹出", bool(app.screen.has_class("ResumePanel"))
+              or app.screen.__class__.__name__ == "ResumePanel",
+              app.screen.__class__.__name__)
+        await pilot.press("escape")
+        await settle(pilot, 10)
+        check("ESC 取消恢复", "已取消恢复" in screen_text(app))
+        # ---- /resume：回车选中第一条（最新保存的）并恢复
+        app.query_one("#composer").value = "/resume"
+        await pilot.press("enter")
+        await settle(pilot, 10)
+        await pilot.press("enter")
+        await settle(pilot, 15)
+        text = screen_text(app)
+        check("面板回车后恢复会话", "已恢复会话" in text)
+        check("历史被回放到消息区", "第一句话" in text, text[:200])
+        check("恢复后 core 历史条数正确", len(app.session.messages) >= 3,
+              "%d 条" % len(app.session.messages))
+    # 清理临时会话目录
+    import shutil
+    shutil.rmtree(tmp, ignore_errors=True)
+
+
 async def main() -> int:
     await case_layout()
     await case_tool_round()
@@ -302,11 +368,12 @@ async def main() -> int:
     await case_clear()
     await case_typing()
     await case_compact()
+    await case_sessions()
     print()
     if FAILS:
         print("有问题（%d 项）：%s" % (len(FAILS), "；".join(FAILS)))
         return 1
-    print("OK：TUI 六个场景全部通过")
+    print("OK：TUI 七个场景全部通过")
     return 0
 
 

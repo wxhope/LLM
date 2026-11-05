@@ -794,6 +794,147 @@ def main() -> int:
             assert bad not in code, "%s 里出现了界面依赖：%s" % (src, bad)
     print("分层检查 -> core 不依赖任何 UI 库")
 
+    # ================================================================
+    #  会话持久化（/save /new /resume 的地基）
+    # ================================================================
+    from xiaoA.core.session_store import (
+        SessionStoreError,
+        list_sessions,
+        load_session,
+        new_session_id,
+        save_session,
+        sessions_dir,
+    )
+
+    sess_root = tempfile.mkdtemp(prefix="xiaoA_sess_")
+    sess_dir = sessions_dir(sess_root)
+    msgs = [
+        {"role": "user", "content": "帮我查宠物档案，重点是 id 42 这一只"},
+        {"role": "assistant", "content": "",
+         "tool_calls": [{"id": "c1", "type": "function", "function":
+                         {"name": "list_pets", "arguments": "{\"limit\": 5}"}}]},
+        {"role": "tool", "tool_call_id": "c1", "content": "Found 5 record(s)"},
+        {"role": "assistant", "content": "查到了，id 42 叫旺财。"},
+    ]
+    meta = save_session(msgs, sess_dir)
+    assert meta.message_count == 4 and "查宠物档案" in meta.title, meta
+    # 同一秒重复保存：编号自动加序号，互相覆盖是不允许的
+    meta2 = save_session(msgs, sess_dir)
+    assert meta2.session_id != meta.session_id, "同秒保存撞了编号"
+    metas = list_sessions(sess_dir)
+    assert len(metas) == 2, metas
+    loaded = load_session(meta.path)
+    assert loaded == msgs, "回读的消息必须和保存时逐字节一致"
+    # 损坏文件：如实报错，不返回半份数据
+    with open(meta.path, "w", encoding="utf-8") as f:
+        f.write("{broken json")
+    try:
+        load_session(meta.path)
+        raise AssertionError("坏文件必须抛 SessionStoreError")
+    except SessionStoreError:
+        pass
+    # 目录都不存在时 new_session_id 也能给编号；list 空目录返回空表
+    assert new_session_id(directory=sess_dir)
+    assert list_sessions(os.path.join(sess_root, "nope")) == []
+    shutil.rmtree(sess_root, ignore_errors=True)
+    print("会话存储 -> 保存/重名加序号/列表/回读一致/坏文件报错")
+
+    # ================================================================
+    #  配置发现与 mock 配置生成（首次运行弹窗的前提）
+    # ================================================================
+    from xiaoA.core.config import ConfigError, load_config, resolve_config_path, write_mock_config
+    from xiaoA.core.config import default_config_path
+
+    empty_dir = tempfile.mkdtemp(prefix="xiaoA_cfg_")
+    mock_path = write_mock_config(os.path.join(empty_dir, "config.ini"))
+    assert os.path.exists(mock_path)
+    text = open(mock_path, encoding="utf-8").read()
+    for section in ("[deepseek]", "[search]", "[fetch]", "[cli]",
+                    "[mcp]", "[context]", "[ui]"):
+        assert section in text, "mock 配置缺 %s" % section
+    # mock 的 key 是占位符：load_config 必须拒绝它（逼用户改成真 Key）
+    try:
+        load_config(mock_path)
+        raise AssertionError("mock 配置应该因 api_key 占位被拒绝")
+    except ConfigError:
+        pass
+    # 解析顺序：显式路径 > 启动目录 > 仓库根；都没有返回 None
+    assert resolve_config_path(mock_path) == mock_path
+    old_cwd = os.getcwd()
+    os.chdir(empty_dir)
+    assert resolve_config_path() == mock_path          # 启动目录优先
+    os.remove(mock_path)
+    # 启动目录没有、仓库根有 → 回落到仓库根（开发机兜底，老用法不破坏）
+    repo_cfg = default_config_path()
+    if os.path.exists(repo_cfg):
+        assert resolve_config_path() == repo_cfg
+    os.chdir(old_cwd)
+    bare = tempfile.mkdtemp(prefix="xiaoA_none_")
+    os.chdir(bare)
+    assert resolve_config_path() is None or resolve_config_path() != mock_path
+    os.chdir(old_cwd)
+    shutil.rmtree(empty_dir, ignore_errors=True)
+    shutil.rmtree(bare, ignore_errors=True)
+    print("配置发现 -> 启动目录优先/仓库根兜底/mock 生成且被 load 拒绝")
+
+    # ================================================================
+    #  AGENTS.md 一次注入 + MCP 异步挂载入口
+    # ================================================================
+    import xiaoA.core.session as session_mod
+    from xiaoA.core.session import Session, read_agents_md
+
+    agents_dir = tempfile.mkdtemp(prefix="xiaoA_agents_")
+    with open(os.path.join(agents_dir, "AGENTS.md"), "w", encoding="utf-8") as f:
+        f.write("# 项目约定\n所有回复用中文。")
+    saved_startup = session_mod.STARTUP_CWD
+    session_mod.STARTUP_CWD = agents_dir      # 项目根按启动目录算，测试里指过去
+    try:
+        cfg = AppConfig(api_key="sk-test", base_url="https://x.invalid",
+                        model="m", agents_md_max_chars=8000)
+        s = Session(cfg, registry=ToolRegistry())
+        # 注入到历史最前面，且只有一条
+        assert len(s.messages) == 1 and s.messages[0]["role"] == "user"
+        assert "项目约定" in s.messages[0]["content"]
+        assert not s.inject_agents_md(), "重复注入必须被幂等挡住"
+        # 没有配置时再来一次
+        os.remove(os.path.join(agents_dir, "AGENTS.md"))
+        s2 = Session(cfg, registry=ToolRegistry())
+        assert s2.messages == [], "没有 AGENTS.md 就不该有注入"
+        assert read_agents_md(agents_dir) is None
+        # 清空历史后重新注入（/clear 的行为）
+        with open(os.path.join(agents_dir, "AGENTS.md"), "w", encoding="utf-8") as f:
+            f.write("# 项目约定\n所有回复用中文。")
+        s.messages.clear()
+        assert s.inject_agents_md() is True
+    finally:
+        session_mod.STARTUP_CWD = saved_startup
+    shutil.rmtree(agents_dir, ignore_errors=True)
+
+    # attach_mcp：异步加载完成后并注册表；重名记 problem 不炸
+    from xiaoA.core.mcp import McpManager, McpToolInfo
+    from xiaoA.core.tools.base import Tool
+
+    class _FakeMgr:
+        pass
+
+    mgr = _FakeMgr()
+    mgr.tools = [Tool(name="getDate", description="重名工具",
+                      parameters={"type": "object", "properties": {}},
+                      handler=lambda a, c: None),
+                 Tool(name="mcp_only", description="远端独有",
+                      parameters={"type": "object", "properties": {}},
+                      handler=lambda a, c: None)]
+    mgr.problems = []
+    cfg = AppConfig(api_key="sk-test", base_url="https://x.invalid", model="m")
+    from xiaoA.core.tools.builtin import datetime_ops
+    s3 = Session(cfg, registry=ToolRegistry([datetime_ops.get_date]))
+    added = s3.attach_mcp(mgr)
+    assert added == ["mcp_only"], added
+    assert s3.registry.get("mcp_only") is not None
+    assert any("重名" in p or "getDate" in p for p in mgr.problems), mgr.problems
+    assert s3.attach_mcp(None) == []
+    print("AGENTS.md/MCP挂载 -> 注入幂等/无文件不注/attach_mcp 撞名进 problems")
+
     print("\nOK：core 层自检全部通过")
     return 0
 

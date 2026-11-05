@@ -65,3 +65,7 @@ Agent/xiaoA/*.docx
 
 # ---------- xiaoA：上下文归档（会话本地数据，含完整对话，不同步）----------
 .agents/context/
+
+# 修正：归档目录可能出现在 Agent/xiaoA 子路径下
+**/.agents/context/
+**/.agents/sessions/

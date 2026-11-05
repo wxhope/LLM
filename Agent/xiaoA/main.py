@@ -25,10 +25,22 @@ if ROOT not in sys.path:
 
 def check_core(config_path=None) -> int:
     """--check：不启动界面，只验证 core 是否能装配起来。"""
-    from xiaoA.core.config import ConfigError, load_config
+    from xiaoA.core.config import (
+        ConfigError,
+        load_config,
+        resolve_config_path,
+        write_mock_config,
+    )
     from xiaoA.core.skills import discover_skills
     from xiaoA.core.tools import build_default_registry
 
+    # 和 TUI 同一个规则：哪里都找不到 config.ini 时，生成一份 mock 并提示
+    if config_path is None and resolve_config_path() is None:
+        created = write_mock_config(os.path.join(os.getcwd(), "config.ini"))
+        print("[提示] 没有 config.ini，已在当前目录生成初始配置：")
+        print("       %s" % created)
+        print("       把里面的 api_key 换成你自己的 Key 后重新运行即可。")
+        return 1
     try:
         cfg = load_config(config_path)
     except ConfigError as e:
@@ -68,6 +80,8 @@ def check_core(config_path=None) -> int:
         mcp = load_mcp_manager(
             connect_timeout=cfg.mcp_connect_timeout,
             call_timeout=cfg.mcp_call_timeout,
+            existing_names=reg.names(),
+            desc_chars=cfg.mcp_desc_chars,
         )
     except Exception as e:                # noqa: BLE001 - 检查命令绝不能被 MCP 炸掉
         mcp = None

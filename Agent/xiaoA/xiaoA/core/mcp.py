@@ -436,6 +436,7 @@ class McpToolInfo:
 def plan_tool_names(
     servers_tools: List[Tuple[str, List[Tuple[str, str, Dict[str, Any]]]]],
     existing_names: List[str],
+    desc_max_chars: int = MAX_DESC_CHARS,
 ) -> Tuple[List[McpToolInfo], List[str]]:
     """决定每个远端工具对外暴露什么名字。纯函数，离线可测。
 
@@ -470,7 +471,7 @@ def plan_tool_names(
                 exposed=exposed,
                 server=server_name,
                 original=name,
-                description=(desc or "").strip()[:MAX_DESC_CHARS],
+                description=(desc or "").strip()[:desc_max_chars],
                 schema=_normalize_schema(schema),
             ))
     return infos, problems
@@ -489,7 +490,9 @@ def _normalize_schema(schema: Any) -> Dict[str, Any]:
 
 
 def build_mcp_tools(connections: List["McpConnection"],
-                    existing_names: List[str]) -> Tuple[List[Tool], List[McpToolInfo], List[str]]:
+                    existing_names: List[str],
+                    desc_max_chars: int = MAX_DESC_CHARS
+                    ) -> Tuple[List[Tool], List[McpToolInfo], List[str]]:
     """对每台已连接的 Server 执行 list_tools，包成本地 Tool 对象。"""
     servers_tools: List[Tuple[str, List[Tuple[str, str, Dict[str, Any]]]]] = []
     problems: List[str] = []
@@ -505,7 +508,8 @@ def build_mcp_tools(connections: List["McpConnection"],
             continue
         servers_tools.append((conn.config.name, tools))
 
-    infos, name_problems = plan_tool_names(servers_tools, existing_names)
+    infos, name_problems = plan_tool_names(servers_tools, existing_names,
+                                           desc_max_chars=desc_max_chars)
     problems.extend(name_problems)
 
     by_server: Dict[str, McpConnection] = {c.config.name: c for c in connections}
@@ -569,8 +573,14 @@ class McpManager:
     @classmethod
     def load(cls, config_path: Optional[str] = None,
              connect_timeout: float = DEFAULT_CONNECT_TIMEOUT,
-             call_timeout: float = DEFAULT_CALL_TIMEOUT) -> "McpManager":
-        """读配置、逐台连接、拉工具清单。任何失败都只进 problems。"""
+             call_timeout: float = DEFAULT_CALL_TIMEOUT,
+             existing_names: Optional[List[str]] = None,
+             desc_chars: int = MAX_DESC_CHARS) -> "McpManager":
+        """读配置、逐台连接、拉工具清单。任何失败都只进 problems。
+
+        existing_names：本地已有的工具名。传进来后远端工具的暴露名才能
+        正确避开冲突（比如远端也有个 RunCli 时会自动加服务器前缀）。
+        """
         path = config_path or os.path.join(STARTUP_CWD, MCP_CONFIG_FILENAME)
         mgr = cls(path, connect_timeout, call_timeout)
 
@@ -594,7 +604,8 @@ class McpManager:
 
         if connections:
             tools, infos, more_problems = build_mcp_tools(
-                connections, existing_names=[])
+                connections, existing_names=list(existing_names or ()),
+                desc_max_chars=desc_chars)
             mgr.tools, mgr.infos = tools, infos
             mgr.problems.extend(more_problems)
             names = "、".join(i.exposed for i in infos)
@@ -611,12 +622,19 @@ class McpManager:
 
 def load_mcp_manager(config_path: Optional[str] = None,
                      connect_timeout: float = DEFAULT_CONNECT_TIMEOUT,
-                     call_timeout: float = DEFAULT_CALL_TIMEOUT) -> Optional[McpManager]:
-    """给 Session 用的入口。没配 .mcp.json 时返回 None——零开销路径。"""
+                     call_timeout: float = DEFAULT_CALL_TIMEOUT,
+                     existing_names: Optional[List[str]] = None,
+                     desc_chars: int = MAX_DESC_CHARS) -> Optional[McpManager]:
+    """入口。没配 .mcp.json 时返回 None——零开销路径。
+
+    TUI 在后台线程里调它（传 existing_names 避开本地工具名），
+    拿到 manager 后用 session.attach_mcp 挂载，MCP 的连接等待不阻塞界面。
+    """
     path = config_path or os.path.join(STARTUP_CWD, MCP_CONFIG_FILENAME)
     if not os.path.exists(path):
         return None
-    mgr = McpManager.load(path, connect_timeout, call_timeout)
+    mgr = McpManager.load(path, connect_timeout, call_timeout,
+                          existing_names=existing_names, desc_chars=desc_chars)
     atexit.register(mgr.shutdown)
     return mgr
 
